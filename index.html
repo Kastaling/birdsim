@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Birdsim — Arcade Avian Flight</title>
+  <style>
+    :root {
+      --hud-fg: #d7e0ea;
+      --hud-dim: #6b7a8c;
+      --panel-bg: rgba(8, 12, 18, 0.55);
+      --accent: #ffb454;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #070b12; }
+    canvas { display: block; }
+
+    #hud {
+      position: fixed; inset: 0; pointer-events: none; z-index: 10;
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      color: var(--hud-fg);
+    }
+    .panel {
+      position: absolute; background: var(--panel-bg);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 10px 14px; backdrop-filter: blur(6px); min-width: 190px;
+    }
+    .panel h2 {
+      font-size: 10px; letter-spacing: 0.2em; color: var(--hud-dim);
+      font-weight: 500; margin-bottom: 6px; text-transform: uppercase;
+    }
+    .row { display: flex; justify-content: space-between; gap: 18px; font-size: 13px; line-height: 1.7; }
+    .row .label { color: var(--hud-dim); }
+
+    #panel-flight { top: 16px; left: 16px; }
+    #panel-payload { top: 16px; right: 16px; text-align: right; }
+    #payload-value.carrying { color: var(--accent); font-weight: 700; }
+    #score-value { font-size: 20px; font-weight: 700; letter-spacing: 0.05em; }
+
+    #hint {
+      position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+      font-size: 11px; letter-spacing: 0.14em; color: var(--hud-dim); text-transform: uppercase;
+      background: var(--panel-bg); padding: 8px 16px; white-space: nowrap;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div class="panel" id="panel-flight">
+      <h2>Flight</h2>
+      <div class="row"><span class="label">ALTITUDE</span><span id="alt-value">0.0 m</span></div>
+      <div class="row"><span class="label">SPEED</span><span id="speed-value">0.0 m/s</span></div>
+    </div>
+
+    <div class="panel" id="panel-payload">
+      <h2>Payload / Score</h2>
+      <div class="row"><span class="label">PAYLOAD</span><span id="payload-value">&mdash;</span></div>
+      <div class="row"><span class="label">SCORE</span><span id="score-value">0</span></div>
+    </div>
+
+    <div id="hint">W/&uarr; climb &middot; S/&darr; dive &middot; A/D bank (auto-coordinated turn) &middot; SPACE drop payload</div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
