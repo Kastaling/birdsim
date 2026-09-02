@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
-  FLIGHT, GRAB, clamp, forwardVector, stepFlight, canGrab, launchVelocity, stepProjectile,
+  FLIGHT, GRAB, THERMAL, clamp, forwardVector, stepFlight, canGrab,
+  launchVelocity, stepProjectile, thermalStrength, impactScore,
 } from './physics.js';
 
 // ---------------------------------------------------------------------------
@@ -33,10 +34,13 @@ try {
   }
   throw err;
 }
-// `false` keeps the CSS 100vw/100vh canvas styling authoritative for display
-// size; three.js only manages the drawing buffer.
+// The drawing buffer is sized from the canvas element's *rendered* box (see
+// syncViewport below), never from raw window metrics — browser sidebars,
+// vertical tab strips, and page zoom can all desync innerWidth/innerHeight
+// from what is actually on screen. A provisional size keeps the renderer valid
+// until the first measured sync after the canvas is attached and laid out.
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.setSize(window.innerWidth || 1, window.innerHeight || 1, false);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
@@ -58,9 +62,51 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87ceeb);
 scene.fog = new THREE.FogExp2(0x87ceeb, 0.003);
 
-const camera = new THREE.PerspectiveCamera(
-  62, window.innerWidth / window.innerHeight, 0.1, 900,
-);
+// Vertical FOV band for the chase cam. The base (minimum) vertical FOV stays at
+// 62° so the bird is never framed tighter than before; on tall/narrow
+// viewports (vertical tabs, phone portrait) the fov widens toward MAX_VERT_FOV
+// to preserve horizontal coverage instead of cropping the turn.
+const BASE_VERT_FOV = 62;   // deg — minimum vertical FOV (floor of the clamp)
+const MAX_VERT_FOV = 85;    // deg — ceiling, avoids fisheye distortion
+const MIN_HORIZ_COVERAGE = THREE.MathUtils.degToRad(70);
+
+// The canvas element's rendered box is the source of truth for viewport size.
+function viewportSize() {
+  const rect = canvas.getBoundingClientRect();
+  let w = Math.round(rect.width);
+  let h = Math.round(rect.height);
+  if (!w || !h) { // not laid out yet (pre-append / hidden) — window fallback
+    w = window.innerWidth;
+    h = window.innerHeight;
+  }
+  return { w, h };
+}
+
+// Vertical FOV needed so the horizontal field of view never drops below
+// MIN_HORIZ_COVERAGE at the given aspect, clamped to [BASE_VERT_FOV, MAX_VERT_FOV].
+function verticalFovFor(aspect) {
+  const needed = THREE.MathUtils.radToDeg(
+    2 * Math.atan(Math.tan(MIN_HORIZ_COVERAGE / 2) / aspect),
+  );
+  return clamp(needed, BASE_VERT_FOV, MAX_VERT_FOV);
+}
+
+const camera = new THREE.PerspectiveCamera(BASE_VERT_FOV, 1, 0.1, 900);
+
+// Keep the projection matrix and drawing buffer matched to the canvas element's
+// actual client box: aspect + adaptive vertical FOV from measured dimensions,
+// pixel ratio re-read (it changes when moving between monitors or zooming), and
+// setSize with the real element size so the WebGL buffer can never mismatch the
+// CSS display size. `false` keeps our 100vw/100vh canvas styling authoritative.
+function syncViewport() {
+  const { w, h } = viewportSize();
+  if (!w || !h) return; // ignore zero-size edge cases (e.g. minimized windows)
+  camera.aspect = w / h;
+  camera.fov = verticalFovFor(camera.aspect);
+  camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(w, h, false);
+}
 
 // Lighting: bright daytime ambient + sky fill so flat-shaded low-poly meshes
 // read crisply in the open, plus a strong warm directional sun that follows
@@ -161,6 +207,92 @@ function mulberry32(seed) {
     rock.rotation.set(rand() * Math.PI, rand() * Math.PI, 0);
     rock.castShadow = true;
     scene.add(rock);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Soaring thermals — rising updraft columns around the arena. Each column is a
+// faint cylinder shell plus a plume of rising particles; flying through one
+// applies vertical lift and regenerates airspeed (see the main loop).
+// ---------------------------------------------------------------------------
+const thermals = []; // { x, z } — deterministic column centers
+{
+  const trand = mulberry32(9001);
+  let placed = 0;
+  while (placed < THERMAL.count && placed < 64) {
+    const x = (trand() * 2 - 1) * (HALF - 45);
+    const z = (trand() * 2 - 1) * (HALF - 45);
+    if (Math.abs(x) < 35 && Math.abs(z) < 35) continue; // keep spawn area clear
+    let tooClose = false;
+    for (const t of thermals) {
+      const dx = t.x - x, dz = t.z - z;
+      if (dx * dx + dz * dz < 70 * 70) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+    thermals.push({ x, z });
+    placed++;
+  }
+}
+
+const thermalColumns = []; // visual state: { x, z, base, mesh, points, parts }
+{
+  const shellMat = new THREE.MeshBasicMaterial({
+    color: 0xfff2d9, transparent: true, opacity: 0.07,
+    side: THREE.DoubleSide, depthWrite: false,
+  });
+  for (const t of thermals) {
+    const base = terrainHeight(t.x, t.z);
+
+    // Faint updraft column shell from the ground to the top of the lift zone.
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(THERMAL.radius, THERMAL.radius * 1.25, THERMAL.topAltitude, 24, 1, true),
+      shellMat,
+    );
+    mesh.position.set(t.x, base + THERMAL.topAltitude / 2, t.z);
+    scene.add(mesh);
+
+    // Rising particle plume — the visible cue for where to soar.
+    const parts = [];
+    const pos = new Float32Array(THERMAL.particleCount * 3);
+    for (let i = 0; i < THERMAL.particleCount; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const r = Math.sqrt(Math.random()) * THERMAL.radius * 0.85;
+      parts.push({
+        x: t.x + Math.cos(a) * r,
+        y: base + 2 + Math.random() * (THERMAL.topAltitude - 4),
+        z: t.z + Math.sin(a) * r,
+        speed: 6 + Math.random() * 8, // m/s upward drift
+      });
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({
+      color: 0xfff7e0, size: 1.5, transparent: true, opacity: 0.5,
+      depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    const points = new THREE.Points(geo, mat);
+    scene.add(points);
+    thermalColumns.push({ x: t.x, z: t.z, base, mesh, points, parts });
+  }
+}
+
+function updateThermals(dt) {
+  for (const col of thermalColumns) {
+    const top = col.base + THERMAL.topAltitude;
+    const attr = col.points.geometry.attributes.position;
+    for (let i = 0; i < col.parts.length; i++) {
+      const pt = col.parts[i];
+      pt.y += pt.speed * dt;
+      if (pt.y > top) { // recycle to the base of the column
+        pt.y = col.base + 2;
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * THERMAL.radius * 0.85;
+        pt.x = col.x + Math.cos(a) * r;
+        pt.z = col.z + Math.sin(a) * r;
+      }
+      attr.setXYZ(i, pt.x, pt.y, pt.z);
+    }
+    attr.needsUpdate = true;
   }
 }
 
@@ -270,6 +402,7 @@ function spawnPrey(kind, x, z) {
     heading: Math.random() * Math.PI * 2,
     speed: 1.5 + Math.random() * 1.5,
     turnTimer: 1 + Math.random() * 3,
+    fleeTimer: 0, // s of active fleeing remaining (0 = calm wandering)
     state: 'wandering', // wandering | carried | launched
   };
   group.position.set(x, terrainHeight(x, z), z);
@@ -291,25 +424,60 @@ for (let i = 0; i < 8; i++) {
   spawnPrey(i % 2 === 0 ? 'rabbit' : 'squirrel', spot.x, spot.z);
 }
 
+// Flee behavior: a low pass (the bird's shadow sweeping the ground) or close
+// proximity spooks prey into bolting directly away from the shadow point.
+const FLEE = {
+  shadowAlt: 15,     // m AGL — below this altitude the shadow is threatening
+  shadowRadius: 42,  // m   — horizontal range at which a low shadow is noticed
+  nearRadius: 26,    // m   — close proximity always triggers a flee
+  speedMult: 2.8,    // flee speed vs wander speed
+  durationMin: 1.2,  // s of fleeing after the trigger
+  durationMax: 2.4,
+};
+
 function updatePrey(dt) {
+  const birdAgl = Math.max(0, birdState.y - terrainHeight(birdState.x, birdState.z));
   for (const p of preyList) {
     if (p.state !== 'wandering') continue;
-    p.turnTimer -= dt;
-    if (p.turnTimer <= 0) {
-      p.heading += (Math.random() - 0.5) * 2.4;
-      p.turnTimer = 1 + Math.random() * 3;
+    const pp = p.group.position;
+    const dx = pp.x - birdState.x; // vector from the bird's shadow to the prey
+    const dz = pp.z - birdState.z;
+    const distSq = dx * dx + dz * dz;
+
+    // Flee trigger: a dive below 15 m AGL within shadow range, or close proximity.
+    if (p.fleeTimer <= 0 &&
+        ((birdAgl < FLEE.shadowAlt && distSq < FLEE.shadowRadius ** 2) ||
+         distSq < FLEE.nearRadius ** 2)) {
+      p.fleeTimer = FLEE.durationMin + Math.random() * (FLEE.durationMax - FLEE.durationMin);
     }
-    const dx = Math.sin(p.heading) * p.speed * dt;
-    const dz = Math.cos(p.heading) * p.speed * dt;
-    let x = p.group.position.x + dx;
-    let z = p.group.position.z + dz;
+
+    let speed = p.speed;
+    if (p.fleeTimer > 0) {
+      // Bolt directly away from the bird's shadow point on the ground.
+      const d = Math.sqrt(distSq) || 1e-4;
+      p.heading = Math.atan2(dx / d, dz / d);
+      speed *= FLEE.speedMult;
+      p.fleeTimer -= dt;
+    } else {
+      // Calm wandering: occasional random heading changes.
+      p.turnTimer -= dt;
+      if (p.turnTimer <= 0) {
+        p.heading += (Math.random() - 0.5) * 2.4;
+        p.turnTimer = 1 + Math.random() * 3;
+      }
+    }
+
+    const mx = Math.sin(p.heading) * speed * dt;
+    const mz = Math.cos(p.heading) * speed * dt;
+    let x = pp.x + mx;
+    let z = pp.z + mz;
     if (Math.abs(x) > PREY_BOUND || Math.abs(z) > PREY_BOUND) {
       p.heading += Math.PI; // bounce off the arena edge
-      x = clamp(p.group.position.x, -PREY_BOUND, PREY_BOUND);
-      z = clamp(p.group.position.z, -PREY_BOUND, PREY_BOUND);
+      x = clamp(pp.x, -PREY_BOUND, PREY_BOUND);
+      z = clamp(pp.z, -PREY_BOUND, PREY_BOUND);
     }
-    p.group.position.set(x, terrainHeight(x, z), z);
-    p.group.rotation.y = Math.atan2(dx, dz);
+    pp.set(x, terrainHeight(x, z), z);
+    p.group.rotation.y = Math.atan2(mx, mz);
   }
 }
 
@@ -377,11 +545,71 @@ function updateProjectiles(dt) {
     pr.group.position.set(pr.x, pr.y, pr.z);
     pr.group.rotation.x += dt * 6; // tumble through the air
     if (pr.y <= terrainHeight(pr.x, pr.z)) {
-      score += GRAB.scoreLaunch;
+      // Impact scoring: kinetic energy of the landing encodes both drop
+      // altitude and launch velocity — harder drops score more.
+      const impactSpeed = Math.hypot(pr.vx, pr.vy, pr.vz);
+      score += impactScore(impactSpeed);
+      spawnImpactBurst(pr.x, terrainHeight(pr.x, pr.z), pr.z, impactSpeed);
       updateHud();
       respawnPrey(pr.prey);
       projectiles.splice(i, 1);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Impact particle bursts — short-lived dust spray on ground collision. The
+// burst size and spread scale with the impact speed.
+// ---------------------------------------------------------------------------
+const bursts = []; // { points, vels: number[], age, life }
+function spawnImpactBurst(x, y, z, speed) {
+  const N = 26;
+  const pos = new Float32Array(N * 3);
+  const vels = [];
+  const power = 4 + Math.min(speed, 55) * 0.35; // spray velocity scale (clamped)
+  for (let i = 0; i < N; i++) {
+    pos[i * 3] = x;
+    pos[i * 3 + 1] = y + 0.3;
+    pos[i * 3 + 2] = z;
+    const a = Math.random() * Math.PI * 2; // azimuth around the impact point
+    const up = 0.45 + Math.random() * 0.6; // upward bias of the spray cone
+    const s = power * (0.5 + Math.random() * 0.7);
+    vels.push(Math.cos(a) * s * 0.6, up * s, Math.sin(a) * s * 0.6);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0xd8b27c, size: 1.4, transparent: true, opacity: 0.95, depthWrite: false,
+  });
+  const points = new THREE.Points(geo, mat);
+  scene.add(points);
+  bursts.push({ points, vels, age: 0, life: 0.9 + Math.random() * 0.4 });
+}
+
+function updateBursts(dt) {
+  for (let i = bursts.length - 1; i >= 0; i--) {
+    const b = bursts[i];
+    b.age += dt;
+    if (b.age >= b.life) {
+      scene.remove(b.points);
+      b.points.geometry.dispose();
+      b.points.material.dispose();
+      bursts.splice(i, 1);
+      continue;
+    }
+    const attr = b.points.geometry.attributes.position;
+    for (let j = 0; j < attr.count; j++) {
+      // Integrate the spray under a softened gravity so it arcs and settles.
+      b.vels[j * 3 + 1] -= FLIGHT.gravity * 0.5 * dt;
+      attr.setXYZ(
+        j,
+        attr.getX(j) + b.vels[j * 3] * dt,
+        Math.max(attr.getY(j) + b.vels[j * 3 + 1] * dt, 0.2),
+        attr.getZ(j) + b.vels[j * 3 + 2] * dt,
+      );
+    }
+    attr.needsUpdate = true;
+    b.points.material.opacity = 0.95 * (1 - b.age / b.life); // fade out
   }
 }
 
@@ -393,7 +621,9 @@ const hud = {
   speed: document.getElementById('speed-value'),
   payload: document.getElementById('payload-value'),
   score: document.getElementById('score-value'),
+  thermal: document.getElementById('thermal-value'),
 };
+let currentThermalLift = 0; // m/s² of updraft applied this frame (for the HUD)
 function updateHud() {
   const agl = Math.max(0, birdState.y - terrainHeight(birdState.x, birdState.z));
   hud.alt.textContent = `${agl.toFixed(1)} m`;
@@ -406,18 +636,30 @@ function updateHud() {
     hud.payload.classList.remove('carrying');
   }
   hud.score.textContent = String(score);
+  if (currentThermalLift > 0.05) {
+    hud.thermal.textContent = `SOARING +${currentThermalLift.toFixed(1)} m/s²`;
+    hud.thermal.classList.add('active');
+  } else {
+    hud.thermal.textContent = '—';
+    hud.thermal.classList.remove('active');
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Chase camera
 // ---------------------------------------------------------------------------
+// Slightly further back than the old 14 m offset so the bird stays fully in
+// frame even when the adaptive FOV sits at its minimum on wide viewports.
+const CHASE_DISTANCE = 16; // m behind/along the nose vector (Z-axis offset)
+const CHASE_HEIGHT = 5.5;  // m above the bird
+
 const camTarget = new THREE.Vector3();
 function updateCamera(dt) {
   const f = forwardVector(birdState.yaw, birdState.pitch);
   camTarget.set(
-    birdState.x - f.x * 14,
-    birdState.y - f.y * 14 + 5.5,
-    birdState.z - f.z * 14,
+    birdState.x - f.x * CHASE_DISTANCE,
+    birdState.y - f.y * CHASE_DISTANCE + CHASE_HEIGHT,
+    birdState.z - f.z * CHASE_DISTANCE,
   );
   camera.position.lerp(camTarget, 1 - Math.exp(-6 * dt));
   camera.lookAt(
@@ -446,9 +688,27 @@ function animate() {
     // --- flight dynamics (pure math from physics.js) ---
     Object.assign(birdState, stepFlight(birdState, readInput(), dt));
 
-    // Arena bounds: soft walls + ground/ceiling clamps.
+    // Arena bounds: soft walls.
     birdState.x = clamp(birdState.x, -BOUND, BOUND);
     birdState.z = clamp(birdState.z, -BOUND, BOUND);
+
+    // --- soaring thermals: vertical lift + airspeed regeneration inside a column ---
+    const aglNow = Math.max(0, birdState.y - terrainHeight(birdState.x, birdState.z));
+    let thermalSum = 0;
+    for (const t of thermals) {
+      thermalSum += thermalStrength(birdState.x, birdState.z, aglNow, t);
+    }
+    const lift = Math.min(thermalSum, 1); // cap stacked columns at full strength
+    if (lift > 0) {
+      birdState.y += THERMAL.liftAccel * lift * dt; // updraft pushes the bird up
+      birdState.speed = clamp(
+        birdState.speed + THERMAL.speedRegen * lift * dt,
+        FLIGHT.minSpeed, FLIGHT.maxSpeed,
+      ); // soaring regenerates airspeed (drag relaxes it back to cruise outside)
+    }
+    currentThermalLift = THERMAL.liftAccel * lift;
+
+    // Ground/ceiling clamps.
     const floorY = terrainHeight(birdState.x, birdState.z) + 1;
     if (birdState.y < floorY) birdState.y = floorY;
     if (birdState.y > CEILING) birdState.y = CEILING;
@@ -485,6 +745,8 @@ function animate() {
     }
 
     updateProjectiles(dt);
+    updateBursts(dt);
+    updateThermals(dt);
 
     // --- sun follows the bird so shadows stay crisp near the action ---
     sun.position.set(birdState.x - 120, birdState.y + 160, birdState.z - 80);
@@ -500,22 +762,17 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-// Robust viewport sync: on every resize (and orientation change) keep the
-// camera projection and drawing buffer matched to the window. devicePixelRatio
-// is re-read because it changes when moving between monitors or zooming; the
-// `false` flag keeps our CSS 100vw/100vh canvas styling authoritative for
-// display size so the aspect ratio can never desync from what is shown.
+// Robust viewport sync: on every resize (and orientation change) re-measure the
+// canvas element's rendered box and keep the projection + drawing buffer matched
+// to it. This is what keeps the bird framed regardless of browser sidebars,
+// vertical tabs, or window scaling — the measured client dimensions are always
+// authoritative over raw window metrics.
 function handleResize() {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-  if (!w || !h) return; // ignore zero-size edge cases (e.g. minimized windows)
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(w, h, false);
+  syncViewport();
 }
 window.addEventListener('resize', handleResize);
 window.addEventListener('orientationchange', handleResize);
+syncViewport(); // initial measured lock-in after first layout
 
 // Frame-1 camera placement: put the chase cam directly behind/above the bird so
 // it and the arena ground are inside the frustum immediately, instead of the
@@ -523,9 +780,9 @@ window.addEventListener('orientationchange', handleResize);
 {
   const f = forwardVector(birdState.yaw, birdState.pitch);
   camera.position.set(
-    birdState.x - f.x * 14,
-    birdState.y - f.y * 14 + 5.5,
-    birdState.z - f.z * 14,
+    birdState.x - f.x * CHASE_DISTANCE,
+    birdState.y - f.y * CHASE_DISTANCE + CHASE_HEIGHT,
+    birdState.z - f.z * CHASE_DISTANCE,
   );
   camera.lookAt(birdState.x + f.x * 8, birdState.y + f.y * 8, birdState.z + f.z * 8);
 }

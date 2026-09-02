@@ -5,8 +5,9 @@
 //   3. grab condition on low swoops
 //   4. launch velocity + projectile integration under gravity
 import {
-  FLIGHT, GRAB, clamp, forwardVector, computeSpeedAccel, stepFlight, canGrab,
-  launchVelocity, stepProjectile,
+  FLIGHT, GRAB, THERMAL, IMPACT, clamp, forwardVector, computeSpeedAccel,
+  stepFlight, canGrab, launchVelocity, stepProjectile, thermalStrength,
+  impactEnergy, impactScore,
 } from '../src/physics.js';
 
 let passed = 0;
@@ -139,6 +140,56 @@ console.log('\n[4] launch velocity & projectile integration');
 
   // Sanity: clamp helper used by the flight model.
   check('clamp bounds values', approx(clamp(5, 0, 3), 3) && approx(clamp(-1, 0, 3), 0) && approx(clamp(2, 0, 3), 2));
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[5] impact scoring engine');
+{
+  // Kinetic energy model: E = ½mv² with normalized unit mass.
+  check('zero-speed impact has zero energy', approx(impactEnergy(0), 0));
+  check('energy = ½v² (v=20 → 200 J)', approx(impactEnergy(20), 200));
+  check('energy grows with speed', impactEnergy(30) > impactEnergy(15));
+
+  // A ~100 m drop from rest under arcade gravity hits at sqrt(2·g·h) = 60 m/s,
+  // which is exactly the reference energy → maxScore.
+  const vRef = Math.sqrt(2 * FLIGHT.gravity * 100);
+  check('reference-energy impact scores max', approx(impactScore(vRef), IMPACT.maxScore));
+  check('gentle landing floors at minScore', approx(impactScore(0), IMPACT.minScore));
+  check('score clamps above reference energy', approx(impactScore(vRef * 2), IMPACT.maxScore));
+  check('score is monotonic in speed', impactScore(10) < impactScore(30) && impactScore(30) < impactScore(60));
+
+  // Drop altitude matters: a higher drop (more fall time → more velocity) scores more.
+  const vLow = Math.sqrt(2 * FLIGHT.gravity * 20);   // 20 m drop from rest
+  const vHigh = Math.sqrt(2 * FLIGHT.gravity * 120); // 120 m drop from rest
+  check('higher drop altitude scores more', impactScore(vHigh) > impactScore(vLow));
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[6] thermal updraft strength');
+{
+  const t = { x: 50, z: -40 };
+  // Full-strength core at ground level.
+  check('column center at ground is full strength', approx(thermalStrength(t.x, t.z, 0, t), 1));
+
+  // Radial falloff: half-radius → sqrt(1 − (½)²) = √0.75 ≈ 0.866.
+  const mid = thermalStrength(t.x + THERMAL.radius / 2, t.z, 0, t);
+  check('radial falloff at half radius', approx(mid, Math.sqrt(0.75), 1e-9));
+
+  // Outside the core radius and above the top altitude: no lift.
+  check('outside core radius gives no lift', thermalStrength(t.x + THERMAL.radius + 1, t.z, 10, t) === 0);
+  check('above top altitude gives no lift', thermalStrength(t.x, t.z, THERMAL.topAltitude + 5, t) === 0);
+
+  // Vertical taper: weakens with altitude but never drops below the 35% floor.
+  const high = thermalStrength(t.x, t.z, THERMAL.topAltitude * 0.8, t);
+  check('updraft weakens with altitude (floor 0.35)', approx(high, 0.35));
+
+  // Strength is always within [0, 1] across a sweep of points.
+  let bounded = true;
+  for (let i = 0; i < 400; i++) {
+    const s = thermalStrength(t.x + Math.sin(i) * THERMAL.radius * 1.5, t.z + Math.cos(i) * THERMAL.radius * 1.5, (i % 200), t);
+    if (!(s >= 0 && s <= 1)) bounded = false;
+  }
+  check('strength stays within [0, 1]', bounded);
 }
 
 // ---------------------------------------------------------------------------

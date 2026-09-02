@@ -35,6 +35,7 @@
     #panel-flight { top: 16px; left: 16px; }
     #panel-payload { top: 16px; right: 16px; text-align: right; }
     #payload-value.carrying { color: var(--accent); font-weight: 700; }
+    #thermal-value.active { color: var(--accent); font-weight: 700; }
     #score-value { font-size: 20px; font-weight: 700; letter-spacing: 0.05em; }
 
     #hint {
@@ -255,6 +256,7 @@
       <h2>Flight</h2>
       <div class="row"><span class="label">ALTITUDE</span><span id="alt-value">0.0 m</span></div>
       <div class="row"><span class="label">SPEED</span><span id="speed-value">0.0 m/s</span></div>
+      <div class="row"><span class="label">THERMAL</span><span id="thermal-value">&mdash;</span></div>
     </div>
 
     <div class="panel" id="panel-payload">
@@ -263,7 +265,7 @@
       <div class="row"><span class="label">SCORE</span><span id="score-value">0</span></div>
     </div>
 
-    <div id="hint">W/&uarr; climb &middot; S/&darr; dive &middot; A/D bank (auto-coordinated turn) &middot; SPACE drop payload</div>
+    <div id="hint">W/&uarr; climb &middot; S/&darr; dive &middot; A/D bank (auto-coordinated turn) &middot; SPACE drop payload &middot; soar in thermals for lift</div>
   </div>
 
   <script type="module" src="/src/main.js"></script>

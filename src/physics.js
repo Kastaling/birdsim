@@ -21,7 +21,23 @@ export const GRAB = Object.freeze({
   radius: 6,           // m   — horizontal grab radius around prey
   altitudeMax: 5,      // m   — max bird height above the prey to trigger a grab
   scoreGrab: 25,       // points awarded on grab
-  scoreLaunch: 75,     // points awarded when the payload lands after launch
+  scoreLaunch: 75,     // legacy flat landing bonus (superseded by impactScore)
+});
+
+export const THERMAL = Object.freeze({
+  count: 5,          // updraft columns scattered around the arena
+  radius: 13,        // m   — horizontal core radius of a column
+  liftAccel: 6,      // m/s² peak vertical updraft at column center
+  speedRegen: 8,     // m/s airspeed recovered per second at full strength
+  topAltitude: 150,  // m AGL — columns taper out above this
+  particleCount: 36, // rising particles per column (visual plume)
+});
+
+export const IMPACT = Object.freeze({
+  mass: 1,          // kg — normalized prey mass for the energy model
+  refEnergy: 1800,  // J  — impact energy that maps to maxScore (~100 m drop from rest)
+  minScore: 15,     // points for a gentle landing
+  maxScore: 250,    // points at reference-energy impact
 });
 
 export function clamp(v, min, max) {
@@ -103,4 +119,35 @@ export function stepProjectile(p, dt) {
   p.y += p.vy * dt;
   p.z += p.vz * dt;
   return p;
+}
+
+// Updraft strength of a thermal column at a point. `agl` is altitude above the
+// local ground (m); t = {x, z} is the column center. Returns 0..1 where 1 is
+// full-strength core lift: radial falloff from 1 (center) to 0 (edge), and a
+// vertical taper that weakens with altitude but never drops below 35%.
+export function thermalStrength(x, z, agl, t) {
+  if (agl < 0 || agl > THERMAL.topAltitude) return 0;
+  const dx = x - t.x;
+  const dz = z - t.z;
+  const r2 = dx * dx + dz * dz;
+  const rMax2 = THERMAL.radius ** 2;
+  if (r2 >= rMax2) return 0;
+  const radial = Math.sqrt(1 - r2 / rMax2);                    // 1 at center → 0 at edge
+  const vertical = clamp(1 - agl / THERMAL.topAltitude, 0.35, 1); // weaker aloft
+  return radial * vertical;
+}
+
+// Kinetic energy (J) of a ground impact at `speed` m/s: E = ½mv². The speed is
+// the payload's total impact velocity, which already encodes both drop altitude
+// (gravity acceleration during the fall) and launch velocity.
+export function impactEnergy(speed) {
+  return 0.5 * IMPACT.mass * speed * speed;
+}
+
+// Arcade score for a ground impact: scales with kinetic energy, clamped to
+// [minScore, maxScore]. A ~100 m drop from rest under arcade gravity hits at
+// sqrt(2·g·h) ≈ 60 m/s → exactly refEnergy → maxScore.
+export function impactScore(speed) {
+  const t = clamp(impactEnergy(speed) / IMPACT.refEnergy, 0, 1);
+  return Math.round(IMPACT.minScore + t * (IMPACT.maxScore - IMPACT.minScore));
 }
