@@ -12,7 +12,7 @@
       --accent: #ffb454;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: #070b12; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #87ceeb; }
     canvas { display: block; }
 
     #hud {
@@ -128,8 +128,53 @@
         el.scrollTop = el.scrollHeight;
       }
 
-      // Global runtime error trap (uncaught exceptions in any script/module).
+      // Third-party analytics / telemetry hosts whose failures (blocked by an
+      // ad-blocker, offline, rate-limited) must never surface in the on-screen
+      // error overlay — they are not part of the app and cannot break it.
+      var THIRD_PARTY_HOSTS = [
+        'cloudflareinsights.com',
+        'google-analytics.com',
+        'googletagmanager.com',
+        'doubleclick.net',
+        'facebook.net',
+        'scorecardresearch.com',
+        'hotjar.com',
+        'newrelic.com',
+      ];
+
+      function isThirdPartyAnalytics(source) {
+        if (!source) return false;
+        var s = String(source);
+        for (var i = 0; i < THIRD_PARTY_HOSTS.length; i++) {
+          if (s.indexOf(THIRD_PARTY_HOSTS[i]) !== -1) return true;
+        }
+        return false;
+      }
+
+      // True when the error's source URL belongs to another origin. Inline and
+      // eval'd code has no http(s) URL and is treated as same-origin app code.
+      function isCrossOriginSource(source) {
+        if (!source) return false;
+        var s = String(source);
+        if (s.indexOf('http://') !== 0 && s.indexOf('https://') !== 0 && s.indexOf('//') !== 0) {
+          return false; // inline script, eval, data: URL — same-origin app code
+        }
+        try {
+          var u = new URL(s, window.location.href);
+          if (u.protocol === 'http:' || u.protocol === 'https:') {
+            return u.hostname !== window.location.hostname;
+          }
+        } catch (_) { /* unparseable — treat as same-origin */ }
+        return false;
+      }
+
+      // Global runtime error trap. Only same-origin app module errors (and the
+      // explicit WebGL initialisation failure rethrown by main.js) activate the
+      // overlay: known third-party analytics noise is ignored entirely, and any
+      // other cross-origin error is left to the console without cluttering it.
       window.onerror = function (message, source, lineno, colno, error) {
+        if (isThirdPartyAnalytics(source)) return true;  // quiet known analytics noise
+        if (isCrossOriginSource(source)) return false;   // no overlay for other external errors
         var detail = String(message || 'Unknown runtime error');
         if (source) detail += '\n  at ' + source + ':' + lineno + ':' + colno;
         if (error && error.stack) detail += '\n' + error.stack;
@@ -141,20 +186,25 @@
       // 'error' event on the element that bubbles to window; a capturing listener
       // catches them even for module scripts. Runtime error events have
       // e.target === window and are skipped here (window.onerror handles those).
+      // A blocked/failed third-party analytics beacon is not an app failure.
       window.addEventListener('error', function (e) {
         var t = e.target;
         if (t && t !== window && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+          var url = String(t.src || t.href || '');
+          if (isThirdPartyAnalytics(url)) return; // quiet third-party analytics load failures
           addEntry(
             'script-load-failure',
-            'Failed to load resource: ' + (t.src || t.href || '(unknown)') +
+            'Failed to load resource: ' + (url || '(unknown)') +
               '\n  The page may be blank because a required script never executed.',
           );
         }
       }, true);
 
-      // Unhandled promise rejections.
+      // Unhandled promise rejections. A rejection whose stack points at a
+      // third-party analytics SDK is not an app failure and stays quiet.
       window.addEventListener('unhandledrejection', function (e) {
         var reason = e.reason;
+        if (reason && typeof reason.stack === 'string' && isThirdPartyAnalytics(reason.stack)) return;
         var detail;
         if (reason instanceof Error) {
           detail = reason.message + '\n' + (reason.stack || '');

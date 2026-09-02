@@ -33,8 +33,10 @@ try {
   }
   throw err;
 }
+// `false` keeps the CSS 100vw/100vh canvas styling authoritative for display
+// size; three.js only manages the drawing buffer.
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setSize(window.innerWidth, window.innerHeight, false);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
@@ -51,18 +53,21 @@ canvas.style.display = 'block';
 document.body.appendChild(canvas);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0a1018);
-scene.fog = new THREE.Fog(0x0a1018, 120, 460);
+// Bright daytime sky; the exponential fog matches it so distant terrain fades
+// into the horizon instead of a dark void.
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.FogExp2(0x87ceeb, 0.003);
 
 const camera = new THREE.PerspectiveCamera(
   62, window.innerWidth / window.innerHeight, 0.1, 900,
 );
 
-// Lighting: ambient + cool sky fill (positive intensities so flat-shaded meshes
-// are never pitch black) plus a warm directional sun that follows the action.
-scene.add(new THREE.AmbientLight(0xffffff, 0.35));
-scene.add(new THREE.HemisphereLight(0x8fb3d9, 0x2e4a2f, 0.75));
-const sun = new THREE.DirectionalLight(0xffe6b0, 1.6);
+// Lighting: bright daytime ambient + sky fill so flat-shaded low-poly meshes
+// read crisply in the open, plus a strong warm directional sun that follows
+// the action and casts soft shadows.
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+scene.add(new THREE.HemisphereLight(0xbfd9f2, 0x557a44, 1.0));
+const sun = new THREE.DirectionalLight(0xffe6b0, 2.2);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.left = -90;
@@ -495,11 +500,22 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
+// Robust viewport sync: on every resize (and orientation change) keep the
+// camera projection and drawing buffer matched to the window. devicePixelRatio
+// is re-read because it changes when moving between monitors or zooming; the
+// `false` flag keeps our CSS 100vw/100vh canvas styling authoritative for
+// display size so the aspect ratio can never desync from what is shown.
+function handleResize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  if (!w || !h) return; // ignore zero-size edge cases (e.g. minimized windows)
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(w, h, false);
+}
+window.addEventListener('resize', handleResize);
+window.addEventListener('orientationchange', handleResize);
 
 // Frame-1 camera placement: put the chase cam directly behind/above the bird so
 // it and the arena ground are inside the frustum immediately, instead of the
