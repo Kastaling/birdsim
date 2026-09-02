@@ -43,9 +43,163 @@
       background: var(--panel-bg); padding: 8px 16px; white-space: nowrap;
       border: 1px solid rgba(255, 255, 255, 0.06);
     }
+
+    /* On-screen runtime error overlay — always visible above the HUD so a
+       crashed module cannot fail silently on a black screen. */
+    #error-log {
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+      z-index: 9999; width: min(520px, calc(100vw - 32px)); max-height: 48vh;
+      overflow-y: auto; pointer-events: none;
+      background: rgba(46, 8, 8, 0.94); border: 1px solid #ff5c5c; border-radius: 6px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      color: #ffd9d9; font-size: 12px; line-height: 1.55; padding: 10px 14px;
+    }
+    #error-log[hidden] { display: none; }
+    #error-log .el-head {
+      font-size: 10px; letter-spacing: 0.2em; color: #ff8a8a;
+      text-transform: uppercase; margin-bottom: 6px;
+    }
+    #error-log-fatal {
+      display: none; margin-bottom: 8px; padding: 8px 10px;
+      background: rgba(255, 92, 92, 0.14); border-left: 3px solid #ff5c5c;
+      color: #fff; font-size: 13px; white-space: pre-wrap; word-break: break-word;
+    }
+    #error-log-fatal .el-fatal-title { font-weight: 700; display: block; margin-bottom: 4px; }
+    #error-log-entries {
+      margin: 0; white-space: pre-wrap; word-break: break-word;
+      color: #ffc9c9;
+    }
+    .el-entry { display: block; padding: 6px 0; border-top: 1px solid rgba(255, 92, 92, 0.25); }
+    .el-entry .el-kind { color: #ff8a8a; font-weight: 700; letter-spacing: 0.08em; }
   </style>
 </head>
 <body>
+  <!-- On-screen runtime error trap. This is a classic (non-module) inline script so it
+       executes immediately — before the deferred /src/main.js module — and therefore
+       survives even if main.js fails to load or throws during evaluation. Every
+       uncaught error, promise rejection, and script-load failure is rendered into
+       the #error-log overlay below instead of dying silently on a black screen. -->
+  <script>
+    (function () {
+      'use strict';
+
+      var logEl = null;
+      var entriesEl = null;
+      var fatalEl = null;
+
+      function ensureLog() {
+        if (logEl) return logEl;
+        logEl = document.getElementById('error-log');
+        if (!logEl) {
+          // Defensive: create the overlay even if the markup is missing.
+          logEl = document.createElement('div');
+          logEl.id = 'error-log';
+          var head = document.createElement('div');
+          head.className = 'el-head';
+          head.textContent = 'Birdsim runtime error log';
+          fatalEl = document.createElement('div');
+          fatalEl.id = 'error-log-fatal';
+          entriesEl = document.createElement('pre');
+          entriesEl.id = 'error-log-entries';
+          logEl.appendChild(head);
+          logEl.appendChild(fatalEl);
+          logEl.appendChild(entriesEl);
+          (document.body || document.documentElement).appendChild(logEl);
+        } else {
+          fatalEl = logEl.querySelector('#error-log-fatal');
+          entriesEl = logEl.querySelector('#error-log-entries');
+        }
+        logEl.hidden = false;
+        return logEl;
+      }
+
+      function addEntry(kind, message) {
+        var el = ensureLog();
+        if (!entriesEl) return;
+        var entry = document.createElement('span');
+        entry.className = 'el-entry';
+        var kindSpan = document.createElement('span');
+        kindSpan.className = 'el-kind';
+        kindSpan.textContent = '[' + new Date().toISOString().slice(11, 19) + '] ' + kind;
+        entry.appendChild(kindSpan);
+        entry.appendChild(document.createTextNode('\n' + String(message)));
+        entriesEl.appendChild(entry);
+        el.scrollTop = el.scrollHeight;
+      }
+
+      // Global runtime error trap (uncaught exceptions in any script/module).
+      window.onerror = function (message, source, lineno, colno, error) {
+        var detail = String(message || 'Unknown runtime error');
+        if (source) detail += '\n  at ' + source + ':' + lineno + ':' + colno;
+        if (error && error.stack) detail += '\n' + error.stack;
+        addEntry('uncaught-error', detail);
+        return false; // do not suppress the browser's default handling
+      };
+
+      // Resource load failures (script/css 404s, network errors). These fire an
+      // 'error' event on the element that bubbles to window; a capturing listener
+      // catches them even for module scripts. Runtime error events have
+      // e.target === window and are skipped here (window.onerror handles those).
+      window.addEventListener('error', function (e) {
+        var t = e.target;
+        if (t && t !== window && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+          addEntry(
+            'script-load-failure',
+            'Failed to load resource: ' + (t.src || t.href || '(unknown)') +
+              '\n  The page may be blank because a required script never executed.',
+          );
+        }
+      }, true);
+
+      // Unhandled promise rejections.
+      window.addEventListener('unhandledrejection', function (e) {
+        var reason = e.reason;
+        var detail;
+        if (reason instanceof Error) {
+          detail = reason.message + '\n' + (reason.stack || '');
+        } else {
+          detail = 'Unhandled promise rejection: ' + String(reason);
+        }
+        addEntry('unhandled-rejection', detail);
+      });
+
+      // Friendly fatal notice used by main.js for expected-but-fatal conditions
+      // (e.g. WebGL context creation failure) so the user sees a clear message
+      // instead of only a raw stack trace.
+      window.birdsimFatal = function (title, detail) {
+        var el = ensureLog();
+        if (!fatalEl) return;
+        fatalEl.style.display = 'block';
+        var t = document.createElement('span');
+        t.className = 'el-fatal-title';
+        t.textContent = title;
+        fatalEl.textContent = '';
+        fatalEl.appendChild(t);
+        if (detail) fatalEl.appendChild(document.createTextNode(String(detail)));
+      };
+
+      // Safety net: if the main module never boots, surface that fact on screen.
+      window.addEventListener('load', function () {
+        setTimeout(function () {
+          var canvas = document.querySelector('canvas');
+          if (!canvas && !logEl) {
+            addEntry(
+              'boot-failure',
+              'No WebGL canvas was created after page load — the main module likely failed to initialize. Check the entries above.',
+            );
+          }
+        }, 1500);
+      });
+    })();
+  </script>
+
+  <div id="error-log" hidden>
+    <div class="el-head">Birdsim runtime error log</div>
+    <div id="error-log-fatal"></div>
+    <pre id="error-log-entries"></pre>
+  </div>
+
   <div id="hud">
     <div class="panel" id="panel-flight">
       <h2>Flight</h2>

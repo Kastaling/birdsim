@@ -15,7 +15,24 @@ const CEILING = 250;          // soft altitude ceiling
 // ---------------------------------------------------------------------------
 // Renderer / scene / camera
 // ---------------------------------------------------------------------------
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+let renderer;
+try {
+  // Throws "Error creating a WebGL context." when neither WebGL2 nor the
+  // legacy WebGL fallback is available (no GPU, drivers disabled, etc.).
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+} catch (err) {
+  // Surface a clear on-screen fallback notice via the trap in index.html, then
+  // rethrow so the global error log also records the underlying failure.
+  if (typeof window.birdsimFatal === 'function') {
+    window.birdsimFatal(
+      'WebGL is not available',
+      'Birdsim could not create a WebGL context on this device/browser, so it cannot render. ' +
+        'Try enabling hardware acceleration, updating your GPU drivers, or using a recent ' +
+        'version of Chrome, Firefox, Edge, or Safari.',
+    );
+  }
+  throw err;
+}
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
@@ -188,6 +205,17 @@ const birdGroup = new THREE.Group();
 scene.add(birdGroup);
 
 // ---------------------------------------------------------------------------
+// Game state: bird flight, payload, score, projectiles
+// NOTE: declared before the ground-prey section below because randomPreySpot()
+// reads birdState during module evaluation (the initial spawn loop). Declaring
+// it later caused a TDZ ReferenceError that aborted the whole module at startup.
+// ---------------------------------------------------------------------------
+const birdState = { x: 0, y: 45, z: 80, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise };
+let carrying = null;   // prey object currently in the talons
+let score = 0;
+const projectiles = []; // { group, x,y,z,vx,vy,vz }
+
+// ---------------------------------------------------------------------------
 // Ground prey (rabbits / squirrels) — wander, get grabbed on a low swoop
 // ---------------------------------------------------------------------------
 function makeRabbit() {
@@ -279,14 +307,6 @@ function updatePrey(dt) {
     p.group.rotation.y = Math.atan2(dx, dz);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Game state: bird flight, payload, score, projectiles
-// ---------------------------------------------------------------------------
-const birdState = { x: 0, y: 45, z: 80, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise };
-let carrying = null;   // prey object currently in the talons
-let score = 0;
-const projectiles = []; // { group, x,y,z,vx,vy,vz }
 
 // ---------------------------------------------------------------------------
 // Input — pitch & roll via WASD / Arrow Keys (yaw auto-coordinates)
