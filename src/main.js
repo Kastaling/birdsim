@@ -20,7 +20,18 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-document.body.appendChild(renderer.domElement);
+
+// Attach the canvas to document.body and force full-viewport styling so it can
+// never collapse to zero size (the classic blank-WebGL-viewport failure mode).
+const canvas = renderer.domElement;
+canvas.style.position = 'absolute';
+canvas.style.top = '0';
+canvas.style.left = '0';
+canvas.style.width = '100vw';
+canvas.style.height = '100vh';
+canvas.style.zIndex = '0';
+canvas.style.display = 'block';
+document.body.appendChild(canvas);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a1018);
@@ -30,7 +41,9 @@ const camera = new THREE.PerspectiveCamera(
   62, window.innerWidth / window.innerHeight, 0.1, 900,
 );
 
-// Lighting: cool sky fill + warm sun that follows the action for crisp shadows.
+// Lighting: ambient + cool sky fill (positive intensities so flat-shaded meshes
+// are never pitch black) plus a warm directional sun that follows the action.
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 scene.add(new THREE.HemisphereLight(0x8fb3d9, 0x2e4a2f, 0.75));
 const sun = new THREE.DirectionalLight(0xffe6b0, 1.6);
 sun.castShadow = true;
@@ -404,57 +417,61 @@ const AXIS_Z = new THREE.Vector3(0, 0, 1);
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
-  const t = clock.elapsedTime;
+  try {
+    // --- flight dynamics (pure math from physics.js) ---
+    Object.assign(birdState, stepFlight(birdState, readInput(), dt));
 
-  // --- flight dynamics (pure math from physics.js) ---
-  Object.assign(birdState, stepFlight(birdState, readInput(), dt));
+    // Arena bounds: soft walls + ground/ceiling clamps.
+    birdState.x = clamp(birdState.x, -BOUND, BOUND);
+    birdState.z = clamp(birdState.z, -BOUND, BOUND);
+    const floorY = terrainHeight(birdState.x, birdState.z) + 1;
+    if (birdState.y < floorY) birdState.y = floorY;
+    if (birdState.y > CEILING) birdState.y = CEILING;
 
-  // Arena bounds: soft walls + ground/ceiling clamps.
-  birdState.x = clamp(birdState.x, -BOUND, BOUND);
-  birdState.z = clamp(birdState.z, -BOUND, BOUND);
-  const floorY = terrainHeight(birdState.x, birdState.z) + 1;
-  if (birdState.y < floorY) birdState.y = floorY;
-  if (birdState.y > CEILING) birdState.y = CEILING;
+    // --- apply orientation to the bird mesh: q = Ry * Rx * Rz ---
+    qYaw.setFromAxisAngle(AXIS_Y, birdState.yaw);
+    qPitch.setFromAxisAngle(AXIS_X, birdState.pitch);
+    qRoll.setFromAxisAngle(AXIS_Z, birdState.roll);
+    birdGroup.quaternion.copy(qYaw).multiply(qPitch).multiply(qRoll);
+    birdGroup.position.set(birdState.x, birdState.y, birdState.z);
+    birdGroup.updateMatrixWorld();
 
-  // --- apply orientation to the bird mesh: q = Ry * Rx * Rz ---
-  qYaw.setFromAxisAngle(AXIS_Y, birdState.yaw);
-  qPitch.setFromAxisAngle(AXIS_X, birdState.pitch);
-  qRoll.setFromAxisAngle(AXIS_Z, birdState.roll);
-  birdGroup.quaternion.copy(qYaw).multiply(qPitch).multiply(qRoll);
-  birdGroup.position.set(birdState.x, birdState.y, birdState.z);
-  birdGroup.updateMatrixWorld();
+    // Wing flap — faster with airspeed.
+    flapPhase += dt * (3 + birdState.speed * 0.4);
+    const flap = Math.sin(flapPhase) * 0.5;
+    birdGroup.userData.wings.left.rotation.z = flap;
+    birdGroup.userData.wings.right.rotation.z = -flap;
 
-  // Wing flap — faster with airspeed.
-  flapPhase += dt * (3 + birdState.speed * 0.4);
-  const flap = Math.sin(flapPhase) * 0.5;
-  birdGroup.userData.wings.left.rotation.z = flap;
-  birdGroup.userData.wings.right.rotation.z = -flap;
-
-  // --- prey: wander, grab check on low swoop ---
-  updatePrey(dt);
-  if (!carrying) {
-    for (const p of preyList) {
-      if (p.state !== 'wandering') continue;
-      const pp = p.group.position;
-      if (canGrab(birdState, { x: pp.x, y: pp.y, z: pp.z })) {
-        grabPrey(p);
-        break;
+    // --- prey: wander, grab check on low swoop ---
+    updatePrey(dt);
+    if (!carrying) {
+      for (const p of preyList) {
+        if (p.state !== 'wandering') continue;
+        const pp = p.group.position;
+        if (canGrab(birdState, { x: pp.x, y: pp.y, z: pp.z })) {
+          grabPrey(p);
+          break;
+        }
       }
+    } else {
+      // Dangle the payload under the belly.
+      carrying.group.position.copy(bellyAnchor.clone().applyMatrix4(birdGroup.matrixWorld));
+      carrying.group.quaternion.copy(birdGroup.quaternion);
     }
-  } else {
-    // Dangle the payload under the belly.
-    carrying.group.position.copy(bellyAnchor.clone().applyMatrix4(birdGroup.matrixWorld));
-    carrying.group.quaternion.copy(birdGroup.quaternion);
+
+    updateProjectiles(dt);
+
+    // --- sun follows the bird so shadows stay crisp near the action ---
+    sun.position.set(birdState.x - 120, birdState.y + 160, birdState.z - 80);
+    sun.target.position.set(birdState.x, birdState.y, birdState.z);
+
+    updateCamera(dt);
+    updateHud();
+  } catch (err) {
+    // Never let a tick exception halt the loop or skip renderer.render —
+    // log it and fall through so this frame still paints.
+    console.error('[birdsim] animation tick failed:', err);
   }
-
-  updateProjectiles(dt);
-
-  // --- sun follows the bird so shadows stay crisp near the action ---
-  sun.position.set(birdState.x - 120, birdState.y + 160, birdState.z - 80);
-  sun.target.position.set(birdState.x, birdState.y, birdState.z);
-
-  updateCamera(dt);
-  updateHud();
   renderer.render(scene, camera);
 }
 
@@ -463,6 +480,19 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Frame-1 camera placement: put the chase cam directly behind/above the bird so
+// it and the arena ground are inside the frustum immediately, instead of the
+// camera lerping in from the origin on the first frames.
+{
+  const f = forwardVector(birdState.yaw, birdState.pitch);
+  camera.position.set(
+    birdState.x - f.x * 14,
+    birdState.y - f.y * 14 + 5.5,
+    birdState.z - f.z * 14,
+  );
+  camera.lookAt(birdState.x + f.x * 8, birdState.y + f.y * 8, birdState.z + f.z * 8);
+}
 
 updateHud();
 animate();
