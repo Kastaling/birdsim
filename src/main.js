@@ -62,47 +62,51 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87ceeb);
 scene.fog = new THREE.FogExp2(0x87ceeb, 0.003);
 
-// Vertical FOV band for the chase cam. The base (minimum) vertical FOV stays at
-// 62° so the bird is never framed tighter than before; on tall/narrow
-// viewports (vertical tabs, phone portrait) the fov widens toward MAX_VERT_FOV
-// to preserve horizontal coverage instead of cropping the turn.
-const BASE_VERT_FOV = 62;   // deg — minimum vertical FOV (floor of the clamp)
-const MAX_VERT_FOV = 85;    // deg — ceiling, avoids fisheye distortion
-const MIN_HORIZ_COVERAGE = THREE.MathUtils.degToRad(70);
+// Fixed vertical FOV for the chase cam. A constant fov keeps framing stable
+// across resizes — only the aspect changes with viewport shape (see
+// syncViewport), which is what makes the projection unambiguous on Vivaldi.
+const CAMERA_FOV = 60; // deg
 
-// The canvas element's rendered box is the source of truth for viewport size.
+// The canvas element's client box is the source of truth for viewport size.
+// Vivaldi on Linux has been observed to report a distorted box from
+// getBoundingClientRect() when browser UI panels shift the layout — that desyncs
+// the drawing buffer from the CSS box and stretches the render.
+// clientWidth/clientHeight track the element's actual CSS box, so they are used
+// instead; if the read is zero or otherwise invalid (pre-append, hidden tab),
+// fall back to the parent's layout box, then raw window metrics.
 function viewportSize() {
-  const rect = canvas.getBoundingClientRect();
-  let w = Math.round(rect.width);
-  let h = Math.round(rect.height);
-  if (!w || !h) { // not laid out yet (pre-append / hidden) — window fallback
-    w = window.innerWidth;
-    h = window.innerHeight;
+  let w = canvas.clientWidth;
+  let h = canvas.clientHeight;
+
+  const sane = Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0;
+  if (!sane) {
+    const parent = canvas.parentElement;
+    if (parent && parent.offsetWidth > 0 && parent.offsetHeight > 0) {
+      w = parent.offsetWidth;
+      h = parent.offsetHeight;
+    } else {
+      w = window.innerWidth || 1;
+      h = window.innerHeight || 1;
+    }
   }
   return { w, h };
 }
 
-// Vertical FOV needed so the horizontal field of view never drops below
-// MIN_HORIZ_COVERAGE at the given aspect, clamped to [BASE_VERT_FOV, MAX_VERT_FOV].
-function verticalFovFor(aspect) {
-  const needed = THREE.MathUtils.radToDeg(
-    2 * Math.atan(Math.tan(MIN_HORIZ_COVERAGE / 2) / aspect),
-  );
-  return clamp(needed, BASE_VERT_FOV, MAX_VERT_FOV);
-}
-
-const camera = new THREE.PerspectiveCamera(BASE_VERT_FOV, 1, 0.1, 900);
+const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 900);
 
 // Keep the projection matrix and drawing buffer matched to the canvas element's
-// actual client box: aspect + adaptive vertical FOV from measured dimensions,
-// pixel ratio re-read (it changes when moving between monitors or zooming), and
-// setSize with the real element size so the WebGL buffer can never mismatch the
-// CSS display size. `false` keeps our 100vw/100vh canvas styling authoritative.
+// actual client box. Aspect guard: camera.aspect is always forced to width /
+// height from measured dimensions — a mismatch between the projection aspect and
+// the real buffer aspect is exactly what stretches the scene on Vivaldi Linux.
+// The fov stays fixed at CAMERA_FOV, the pixel ratio is re-read (it changes when
+// moving between monitors or zooming), and setSize uses the real element size so
+// the WebGL buffer can never mismatch the CSS display size. `false` keeps our
+// 100vw/100vh canvas styling authoritative.
 function syncViewport() {
   const { w, h } = viewportSize();
   if (!w || !h) return; // ignore zero-size edge cases (e.g. minimized windows)
-  camera.aspect = w / h;
-  camera.fov = verticalFovFor(camera.aspect);
+  camera.aspect = w / h; // explicit aspect guard: projection and buffer always agree
+  camera.fov = CAMERA_FOV; // fixed vertical FOV — no adaptive widening
   camera.updateProjectionMatrix();
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(w, h, false);
@@ -763,7 +767,7 @@ function animate() {
 }
 
 // Robust viewport sync: on every resize (and orientation change) re-measure the
-// canvas element's rendered box and keep the projection + drawing buffer matched
+// canvas element's client box and keep the projection + drawing buffer matched
 // to it. This is what keeps the bird framed regardless of browser sidebars,
 // vertical tabs, or window scaling — the measured client dimensions are always
 // authoritative over raw window metrics.
@@ -772,6 +776,14 @@ function handleResize() {
 }
 window.addEventListener('resize', handleResize);
 window.addEventListener('orientationchange', handleResize);
+
+// Vivaldi on Linux can shift its UI panels (sidebar, vertical tab strip) without
+// firing a window 'resize' event — watching the parent box directly catches those
+// layout shifts immediately and re-syncs before a distorted frame paints.
+if (typeof ResizeObserver !== 'undefined' && canvas.parentElement) {
+  new ResizeObserver(handleResize).observe(canvas.parentElement);
+}
+
 syncViewport(); // initial measured lock-in after first layout
 
 // Frame-1 camera placement: put the chase cam directly behind/above the bird so
