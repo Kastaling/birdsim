@@ -1,0 +1,7 @@
+services:
+  birdsim:
+    build: .
+    container_name: birdsim-app
+    ports:
+      - "8058:80" # host port for Nginx Proxy Manager -> nginx internal port 80
+    restart: unless-stopped
