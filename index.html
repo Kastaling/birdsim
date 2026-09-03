@@ -36,7 +36,29 @@
     #panel-payload { top: 16px; right: 16px; text-align: right; }
     #payload-value.carrying { color: var(--accent); font-weight: 700; }
     #thermal-value.active { color: var(--accent); font-weight: 700; }
+    #tuck-value.active { color: var(--accent); font-weight: 700; text-shadow: 0 0 8px rgba(255, 180, 84, 0.6); }
     #score-value { font-size: 20px; font-weight: 700; letter-spacing: 0.05em; }
+
+    /* Speed-streak overlay — vertical lines streaming past the screen edges
+       while the bird is tucked above the stretch threshold (toggled by
+       updateHud in main.js). The radial mask keeps the center clear so only
+       peripheral streaks read as motion blur. */
+    #speedlines {
+      position: fixed; inset: 0; z-index: 5; pointer-events: none; opacity: 0;
+      transition: opacity 0.3s ease-out;
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent 0px, transparent 46px,
+        rgba(255, 255, 255, 0.12) 48px, rgba(255, 255, 255, 0.12) 50px
+      );
+      -webkit-mask-image: radial-gradient(ellipse at center, transparent 32%, black 80%);
+      mask-image: radial-gradient(ellipse at center, transparent 32%, black 80%);
+    }
+    #speedlines.on { animation: speedline-stream 0.45s linear infinite; }
+    @keyframes speedline-stream {
+      from { background-position-y: 0px; }
+      to   { background-position-y: 50px; }
+    }
 
     #hint {
       position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
@@ -251,12 +273,16 @@
     <pre id="error-log-entries"></pre>
   </div>
 
+  <!-- Speed-streak overlay for the wing-tuck speed stretch (see CSS above). -->
+  <div id="speedlines"></div>
+
   <div id="hud">
     <div class="panel" id="panel-flight">
       <h2>Flight</h2>
       <div class="row"><span class="label">ALTITUDE</span><span id="alt-value">0.0 m</span></div>
       <div class="row"><span class="label">SPEED</span><span id="speed-value">0.0 m/s</span></div>
       <div class="row"><span class="label">THERMAL</span><span id="thermal-value">&mdash;</span></div>
+      <div class="row"><span class="label">TUCK</span><span id="tuck-value">&mdash;</span></div>
     </div>
 
     <div class="panel" id="panel-payload">
@@ -265,7 +291,7 @@
       <div class="row"><span class="label">SCORE</span><span id="score-value">0</span></div>
     </div>
 
-    <div id="hint">W/&uarr; climb &middot; S/&darr; dive &middot; A/D bank (auto-coordinated turn) &middot; SPACE drop payload &middot; soar in thermals for lift</div>
+    <div id="hint">W/&uarr; climb &middot; S/&darr; dive &middot; A/D bank (auto-coordinated turn) &middot; SHIFT tuck (high-speed dive, pitch up on release for a burst) &middot; SPACE drop payload &middot; soar in thermals for lift</div>
   </div>
 
   <script type="module" src="/src/main.js"></script>

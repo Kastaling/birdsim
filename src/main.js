@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import {
-  FLIGHT, GRAB, THERMAL, clamp, forwardVector, stepFlight, canGrab,
+  FLIGHT, GRAB, THERMAL, TUCK, clamp, forwardVector, stepFlight, canGrab,
   launchVelocity, stepProjectile, thermalStrength, impactScore,
 } from './physics.js';
 
@@ -351,7 +351,10 @@ scene.add(birdGroup);
 // reads birdState during module evaluation (the initial spawn loop). Declaring
 // it later caused a TDZ ReferenceError that aborted the whole module at startup.
 // ---------------------------------------------------------------------------
-const birdState = { x: 0, y: 45, z: 80, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise };
+const birdState = {
+  x: 0, y: 45, z: 80, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise,
+  isTucking: false, tuckMomentum: 0, // wing-tuck dive state (see physics.js TUCK)
+};
 let carrying = null;   // prey object currently in the talons
 let score = 0;
 const projectiles = []; // { group, x,y,z,vx,vy,vz }
@@ -486,7 +489,8 @@ function updatePrey(dt) {
 }
 
 // ---------------------------------------------------------------------------
-// Input — pitch & roll via WASD / Arrow Keys (yaw auto-coordinates)
+// Input — pitch & roll via WASD / Arrow Keys (yaw auto-coordinates); tuck via
+// holding Shift or the left trigger on a connected gamepad.
 // ---------------------------------------------------------------------------
 const keys = new Set();
 window.addEventListener('keydown', (e) => {
@@ -500,12 +504,30 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => keys.clear());
 
+// Tuck trigger: Shift held on the keyboard, or button 7 (left trigger in the
+// standard gamepad mapping) pressed. Gamepad polling is best-effort — if the
+// API is unavailable the keyboard path still works.
+function tuckHeld() {
+  if (keys.has('ShiftLeft') || keys.has('ShiftRight')) return true;
+  try {
+    const pads = navigator.getGamepads ? Array.from(navigator.getGamepads()) : [];
+    for (const pad of pads) {
+      if (pad && pad.buttons[7] && pad.buttons[7].pressed) return true;
+    }
+  } catch (_) { /* no gamepad API — keyboard only */ }
+  return false;
+}
+
 function readInput() {
   const up = keys.has('KeyW') || keys.has('ArrowUp');
   const down = keys.has('KeyS') || keys.has('ArrowDown');
   const left = keys.has('KeyA') || keys.has('ArrowLeft');
   const right = keys.has('KeyD') || keys.has('ArrowRight');
-  return { pitch: (up ? 1 : 0) + (down ? -1 : 0), roll: (left ? 1 : 0) + (right ? -1 : 0) };
+  return {
+    pitch: (up ? 1 : 0) + (down ? -1 : 0),
+    roll: (left ? 1 : 0) + (right ? -1 : 0),
+    isTucking: tuckHeld(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +648,9 @@ const hud = {
   payload: document.getElementById('payload-value'),
   score: document.getElementById('score-value'),
   thermal: document.getElementById('thermal-value'),
+  tuck: document.getElementById('tuck-value'),
 };
+const speedlinesEl = document.getElementById('speedlines');
 let currentThermalLift = 0; // m/s² of updraft applied this frame (for the HUD)
 function updateHud() {
   const agl = Math.max(0, birdState.y - terrainHeight(birdState.x, birdState.z));
@@ -646,6 +670,28 @@ function updateHud() {
   } else {
     hud.thermal.textContent = '—';
     hud.thermal.classList.remove('active');
+  }
+
+  // Wing-tuck status: lit while the tuck key is actively held.
+  if (birdState.isTucking) {
+    hud.tuck.textContent = '[ TUCK ]';
+    hud.tuck.classList.add('active');
+  } else {
+    hud.tuck.textContent = '—';
+    hud.tuck.classList.remove('active');
+  }
+
+  // Speed-line overlay: streams past while tucked above the stretch threshold,
+  // fading in with airspeed for a sense of velocity.
+  if (birdState.isTucking && birdState.speed > TUCK_FOV_THRESHOLD) {
+    const over = clamp(
+      (birdState.speed - TUCK_FOV_THRESHOLD) / (TUCK.maxSpeed - TUCK_FOV_THRESHOLD), 0, 1,
+    );
+    speedlinesEl.classList.add('on');
+    speedlinesEl.style.opacity = String(0.35 + 0.65 * over);
+  } else {
+    speedlinesEl.classList.remove('on');
+    speedlinesEl.style.opacity = '0';
   }
 }
 
@@ -673,11 +719,33 @@ function updateCamera(dt) {
   );
 }
 
+// Speed-stretch FOV: while tucking above the threshold speed, widen the field
+// of view proportionally to airspeed for a sense of velocity; ease back to the
+// base CAMERA_FOV on release. (syncViewport resets fov to the base value on
+// resize events — this runs every frame and re-applies the stretch.)
+const TUCK_FOV_THRESHOLD = 35; // m/s — speed-stretch kicks in above this while tucking
+const TUCK_FOV_EXTRA = 12;     // deg — max extra widening at TUCK.maxSpeed
+
+function updateCameraFov(dt) {
+  let targetFov = CAMERA_FOV;
+  if (birdState.isTucking && birdState.speed > TUCK_FOV_THRESHOLD) {
+    const over = clamp(
+      (birdState.speed - TUCK_FOV_THRESHOLD) / (TUCK.maxSpeed - TUCK_FOV_THRESHOLD), 0, 1,
+    );
+    targetFov = CAMERA_FOV + TUCK_FOV_EXTRA * over;
+  }
+  camera.fov += (targetFov - camera.fov) * Math.min(1, 5 * dt); // smooth ease in/out
+  if (Math.abs(camera.fov - targetFov) < 0.01) camera.fov = targetFov; // settle exactly
+  camera.updateProjectionMatrix();
+}
+
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 const clock = new THREE.Clock();
 let flapPhase = 0;
+let tuckAmount = 0; // eased 0..1 — how far the wings are folded into a tuck
+const TUCK_WING_FOLD = 0.8; // rad of inward fold at full tuck (~46°)
 const qYaw = new THREE.Quaternion();
 const qPitch = new THREE.Quaternion();
 const qRoll = new THREE.Quaternion();
@@ -725,11 +793,18 @@ function animate() {
     birdGroup.position.set(birdState.x, birdState.y, birdState.z);
     birdGroup.updateMatrixWorld();
 
-    // Wing flap — faster with airspeed.
+    // Wing tuck: ease the fold amount toward 1 while holding the tuck key and
+    // back to 0 on release. Tucked wings lock (flap damped) and fold inward
+    // against the body — left pivot +Z, right pivot −Z sweeps both tips toward
+    // the centerline and down along the flanks.
+    const targetTuck = birdState.isTucking ? 1 : 0;
+    tuckAmount += (targetTuck - tuckAmount) * Math.min(1, 8 * dt);
+
+    // Wing flap — faster with airspeed, but locked while tucking.
     flapPhase += dt * (3 + birdState.speed * 0.4);
-    const flap = Math.sin(flapPhase) * 0.5;
-    birdGroup.userData.wings.left.rotation.z = flap;
-    birdGroup.userData.wings.right.rotation.z = -flap;
+    const flap = Math.sin(flapPhase) * 0.5 * (1 - tuckAmount * 0.85);
+    birdGroup.userData.wings.left.rotation.z = flap + TUCK_WING_FOLD * tuckAmount;
+    birdGroup.userData.wings.right.rotation.z = -flap - TUCK_WING_FOLD * tuckAmount;
 
     // --- prey: wander, grab check on low swoop ---
     updatePrey(dt);
@@ -757,6 +832,7 @@ function animate() {
     sun.target.position.set(birdState.x, birdState.y, birdState.z);
 
     updateCamera(dt);
+    updateCameraFov(dt);
     updateHud();
   } catch (err) {
     // Never let a tick exception halt the loop or skip renderer.render —
