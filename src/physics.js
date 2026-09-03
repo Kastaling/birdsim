@@ -24,7 +24,9 @@ export const FLIGHT = Object.freeze({
 // the nose down trades altitude for airspeed (gravity along the flight path —
 // there is no artificial accelerator). Releasing while level or pitched up
 // catches the air: vertical fall momentum converts back into forward glide
-// speed as full aerodynamic lift re-engages.
+// speed as full aerodynamic lift re-engages. While tucking with no pitch input
+// held, the nose also weathervanes down toward the actual velocity vector
+// (weathercocking): target = -atan2(-vy, speed), approached at weathercockRate.
 export const TUCK = Object.freeze({
   liftFactor: 0.1,      // fraction of normal aerodynamic lift retained (90% reduction)
   diveDrag: 0.08,       // 1/s — reduced drag opposing the gravity gain in a locked-wing dive
@@ -36,6 +38,7 @@ export const TUCK = Object.freeze({
   residualBank: 0.5,    // fraction of excess airspeed above cruise banked as residual momentum on release
   rollFactor: 0.15,     // roll input authority multiplier (locked wings)
   yawFactor: 0.25,      // auto-coordinated turn rate multiplier (locked wings)
+  weathercockRate: 3,   // 1/s — rate-limited lerp of pitch toward the velocity angle while tucking with no input
   maxSpeed: 90,         // m/s — elevated speed ceiling while tucking / with residual momentum
   momentumDecay: 12,    // m/s per second that residual momentum bleeds off after release
 });
@@ -107,7 +110,10 @@ export function computeSpeedAccel(speed, pitch, isTucking = false) {
 // tuck flag comes from held input each frame and is recorded on the returned
 // state. While tucking, lift is ~90% gone: horizontal speed bleeds off unless
 // the nose points down into a dive, and the bird drops in a ballistic arc under
-// gravity tracked as `vy` (vertical fall velocity, negative = falling).
+// gravity tracked as `vy` (vertical fall velocity, negative = falling). With no
+// active pitch input while tucking, the nose weathervanes toward the actual
+// velocity vector — target -atan2(-vy, speed), the fall angle below horizontal —
+// via a rate-limited lerp (weathercocking); held pitch input suppresses it.
 // Releasing while level or pitched up catches the air — vertical fall momentum
 // converts to forward glide speed and full aerodynamic lift re-engages.
 // Returns a new state object.
@@ -117,7 +123,7 @@ export function stepFlight(state, input = {}, dt) {
   let vy = state.vy || 0; // vertical fall velocity (m/s, negative = falling); tuck only
 
   // Pitch authority is unchanged by the tuck — pulling out of a dive still works.
-  const pitch = clamp(
+  let pitch = clamp(
     state.pitch + (input.pitch || 0) * FLIGHT.pitchRate * dt,
     -FLIGHT.maxPitch,
     FLIGHT.maxPitch,
@@ -144,6 +150,16 @@ export function stepFlight(state, input = {}, dt) {
   if (isTucking) {
     vy -= TUCK.fallGravity * Math.cos(pitch) * (1 - TUCK.liftFactor) * dt;
     vy = clamp(vy, -TUCK.maxFallSpeed, 0);
+  }
+
+  // Weathercocking: with no active pitch input while tucking, the nose aligns
+  // with the actual velocity vector. The fall component tilts the flight path
+  // below horizontal by atan2(-vy, speed) (vy <= 0 here), so the target attitude
+  // is that angle pitched down; a rate-limited lerp weathervanes into it without
+  // overriding player steering — any held pitch input disables the alignment.
+  if (isTucking && !input.pitch) {
+    const velAngle = Math.atan2(-vy, speed); // radians below horizontal
+    pitch += (-velAngle - pitch) * Math.min(1, TUCK.weathercockRate * dt);
   }
 
   // Residual dive momentum: banked on release from excess airspeed above cruise,

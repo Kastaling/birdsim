@@ -4,7 +4,7 @@
 //   2. forward-vector orientation math
 //   3. grab condition on low swoops
 //   4. launch velocity + projectile integration under gravity
-//   7. wing-tuck lift loss, ballistic fall arcs, and gravity dives
+//   7. wing-tuck lift loss, ballistic fall arcs, gravity dives & weathercocking
 import {
   FLIGHT, GRAB, THERMAL, IMPACT, TUCK, clamp, forwardVector, computeSpeedAccel,
   stepFlight, canGrab, launchVelocity, stepProjectile, thermalStrength,
@@ -211,9 +211,32 @@ console.log('\n[7] wing-tuck dive mechanic');
 
   // --- ballistic fall arc: level tuck converts forward momentum into a drop ---
   let lt = { x: 0, y: 200, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
-  for (let i = 0; i < 80; i++) lt = stepFlight(lt, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 4 s level tuck
-  check('level tuck bleeds forward airspeed', lt.speed < FLIGHT.baseCruise - 10, `got ${lt.speed}`);
+  for (let i = 0; i < 80; i++) lt = stepFlight(lt, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 4 s passive level tuck
   check('level tuck falls in a ballistic arc under gravity', lt.y < 200 - 30 && lt.vy < 0, `y=${lt.y} vy=${lt.vy}`);
+
+  // --- weathercocking: passive tucks align the nose with the velocity vector ---
+  // With no pitch input held while tucking, the nose weathervanes down toward
+  // the actual flight path — target = -atan2(-vy, speed), the fall angle below
+  // horizontal — instead of bleeding airspeed in a level attitude.
+  check('passive level tuck pitches the nose down', lt.pitch < -0.2, `pitch=${lt.pitch}`);
+  const velAngle = Math.atan2(-lt.vy, lt.speed); // radians below horizontal
+  check('tuck weathervanes toward the velocity angle (converged)',
+    Math.abs(lt.pitch + velAngle) < 0.15, `pitch=${lt.pitch} target=${-velAngle}`);
+  check('weathercocked tuck holds airspeed via the dive trade (no level bleed)',
+    lt.speed > FLIGHT.baseCruise - 5, `got ${lt.speed}`);
+
+  // One-step lerp exactness: pitch closes min(1, rate*dt) of the gap to target.
+  const w0 = { x: 0, y: 100, z: 0, speed: 30, yaw: 0, pitch: 0.5, roll: 0, vy: -12 };
+  const w1 = stepFlight(w0, { pitch: 0, roll: 0, isTucking: true }, 0.05);
+  const wSpeed = 30 + computeSpeedAccel(30, 0.5, true) * 0.05; // pre-clamp speed this step
+  const wVy = -12 - TUCK.fallGravity * Math.cos(0.5) * (1 - TUCK.liftFactor) * 0.05;
+  const wTarget = -Math.atan2(-wVy, wSpeed);
+  check('weathercock lerp closes rate*dt of the gap in one step',
+    approx(w1.pitch, 0.5 + (wTarget - 0.5) * Math.min(1, TUCK.weathercockRate * 0.05), 1e-9), `got ${w1.pitch}`);
+
+  // Active pitch input suppresses the alignment — steering is never overridden.
+  const wi = stepFlight({ x: 0, y: 100, z: 0, speed: 30, yaw: 0, pitch: -0.8, roll: 0, vy: -20 }, { pitch: -1, roll: 0, isTucking: true }, 0.05);
+  check('held pitch input suppresses weathercocking', approx(wi.pitch, -0.8 - FLIGHT.pitchRate * 0.05), `got ${wi.pitch}`);
 
   // Fall velocity saturates at the terminal fall speed.
   let lf = { x: 0, y: 500, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
@@ -256,22 +279,37 @@ console.log('\n[7] wing-tuck dive mechanic');
   }
 
   // --- catch air on release: vertical fall momentum -> forward glide speed ---
+  // Weathercocking tips a passive level tuck below the catch pitch, so catching
+  // the air now requires holding the nose up while tucking (active input
+  // suppresses the alignment), then releasing at or above TUCK.catchPitch.
   let ct = { x: 0, y: 200, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
-  for (let i = 0; i < 80; i++) ct = stepFlight(ct, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 4 s level tuck
+  for (let i = 0; i < 80; i++) ct = stepFlight(ct, { pitch: 1, roll: 0, isTucking: true }, 0.05); // 4 s tuck, nose held up
   const preCatch = ct.speed;
   const fallVy = ct.vy;
-  check('level tuck builds vertical fall momentum', fallVy < -10, `vy=${fallVy}`);
+  check('nose-up tuck builds vertical fall momentum', fallVy < -5, `vy=${fallVy}`);
 
-  // Release while level: the catch converts fall velocity into forward glide speed.
+  // Release while pitched up: the catch converts fall velocity into forward glide speed.
   const caught = stepFlight(ct, { pitch: 0, roll: 0, isTucking: false }, 0.05);
-  check('releasing level catches the air (fall -> forward glide)',
+  check('releasing pitched-up catches the air (fall -> forward glide)',
     Math.abs(caught.speed - (preCatch + (-fallVy) * TUCK.catchFactor)) < 1 && caught.speed > preCatch, `got ${caught.speed} vs ${preCatch}`);
   check('fall velocity cleared after wing re-engage', caught.vy === 0);
 
-  // Full lift restored: holding level relaxes the catch speed back toward cruise.
+  // Full lift restored: pull the nose back to level, then speed relaxes to cruise.
   let settle = caught;
+  for (let i = 0; i < 200 && settle.pitch > 0.02; i++) settle = stepFlight(settle, { pitch: -1, roll: 0 }, 0.05);
+  check('nose returns to level after the catch', Math.abs(settle.pitch) <= 0.02 + FLIGHT.pitchRate * 0.05, `pitch=${settle.pitch}`);
   for (let i = 0; i < 300; i++) settle = stepFlight(settle, { pitch: 0, roll: 0 }, 0.05); // 15 s level
   check('full lift restored after catch (speed relaxes to cruise)', Math.abs(settle.speed - FLIGHT.baseCruise) < 2, `got ${settle.speed}`);
+
+  // A passive level tuck weathervanes below the catch pitch, so releasing it
+  // continues the dive instead of catching the air.
+  let pw = { x: 0, y: 200, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
+  for (let i = 0; i < 80; i++) pw = stepFlight(pw, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 4 s passive level tuck
+  check('passive level tuck ends below the catch pitch', pw.pitch < TUCK.catchPitch, `pitch=${pw.pitch}`);
+  const prePassive = pw.speed;
+  const released = stepFlight(pw, { pitch: 0, roll: 0, isTucking: false }, 0.05);
+  check('releasing a weathercocked tuck continues the dive (no catch)',
+    Math.abs(released.speed - prePassive) < 1 && released.vy === 0, `got ${released.speed} vs ${prePassive}`);
 
   // Releasing mid-dive (still steeply down) does NOT convert fall momentum —
   // the dive keeps trading altitude for speed on its own.
