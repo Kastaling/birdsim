@@ -1,17 +1,21 @@
 import * as THREE from 'three';
 import {
-  FLIGHT, GRAB, THERMAL, TUCK, clamp, forwardVector, stepFlight, canGrab,
-  launchVelocity, stepProjectile, thermalStrength, impactScore,
+  FLIGHT, GRAB, THERMAL, TUCK, WORLD, ARCH, clamp, forwardVector, stepFlight, canGrab,
+  launchVelocity, stepProjectile, thermalStrength, impactScore, terrainHeight, isInsideArena,
 } from './physics.js';
 
 // ---------------------------------------------------------------------------
-// Arena constants
+// Arena constants (750 x 750 m world — see WORLD in physics.js)
 // ---------------------------------------------------------------------------
-const ARENA = 300;            // world units (meters) — bounded low-poly arena
-const HALF = ARENA / 2;       // 150
+const ARENA = WORLD.size;     // world units (meters) — bounded low-poly arena
+const HALF = WORLD.half;      // 375
 const BOUND = HALF - 8;       // soft flight boundary for the bird
 const PREY_BOUND = HALF - 14; // wander boundary for ground prey
 const CEILING = 250;          // soft altitude ceiling
+
+// Bird spawn / crash-reset point: open valley south of the central ridge,
+// facing north into the hollow-mountain arch.
+const SPAWN = { x: 0, y: 45, z: 80 };
 
 // ---------------------------------------------------------------------------
 // Renderer / scene / camera
@@ -58,9 +62,10 @@ document.body.appendChild(canvas);
 
 const scene = new THREE.Scene();
 // Bright daytime sky; the exponential fog matches it so distant terrain fades
-// into the horizon instead of a dark void.
+// into the horizon instead of a dark void. Density is tuned for the 750 m
+// arena: near views stay crisp while far mountains haze out at ~1 km.
 scene.background = new THREE.Color(0x87ceeb);
-scene.fog = new THREE.FogExp2(0x87ceeb, 0.003);
+scene.fog = new THREE.FogExp2(0x87ceeb, 0.0012);
 
 // Fixed vertical FOV for the chase cam. A constant fov keeps framing stable
 // across resizes — only the aspect changes with viewport shape (see
@@ -92,7 +97,9 @@ function viewportSize() {
   return { w, h };
 }
 
-const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 900);
+// Far plane covers the full arena diagonal (~1060 m) plus margin so terrain at
+// the opposite corner is never clipped.
+const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 1600);
 
 // Keep the projection matrix and drawing buffer matched to the canvas element's
 // actual client box. Aspect guard: camera.aspect is always forced to width /
@@ -119,27 +126,24 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 scene.add(new THREE.HemisphereLight(0xbfd9f2, 0x557a44, 1.0));
 const sun = new THREE.DirectionalLight(0xffe6b0, 2.2);
 sun.castShadow = true;
+// Shadow frustum is wide enough to catch the flanks of nearby mountains.
 sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.left = -90;
-sun.shadow.camera.right = 90;
-sun.shadow.camera.top = 90;
-sun.shadow.camera.bottom = -90;
+sun.shadow.camera.left = -140;
+sun.shadow.camera.right = 140;
+sun.shadow.camera.top = 140;
+sun.shadow.camera.bottom = -140;
 sun.shadow.camera.near = 10;
-sun.shadow.camera.far = 500;
+sun.shadow.camera.far = 700;
 scene.add(sun);
 scene.add(sun.target);
 
 // ---------------------------------------------------------------------------
-// Terrain — bounded low-poly arena (300 x 300)
+// Terrain — bounded low-poly arena (750 x 750). The heightmap itself lives in
+// physics.js (terrainHeight) so the mesh and every collision check share one
+// source of truth: valley floors, rolling foothills, sharp peaks, and the
+// central ridge with its carved tunnel.
 // ---------------------------------------------------------------------------
-function terrainHeight(x, z) {
-  return (
-    Math.sin(x * 0.04) * Math.cos(z * 0.033) * 7 +
-    Math.sin(x * 0.1 + 2) * Math.sin(z * 0.08) * 2
-  );
-}
-
-const terrainGeo = new THREE.PlaneGeometry(ARENA, ARENA, 72, 72);
+const terrainGeo = new THREE.PlaneGeometry(ARENA, ARENA, 160, 160);
 terrainGeo.rotateX(-Math.PI / 2);
 {
   const pos = terrainGeo.attributes.position;
@@ -173,6 +177,80 @@ scene.add(terrain);
   scene.add(north, south, east, west);
 }
 
+// ---------------------------------------------------------------------------
+// Hollow mountain / arch structure — the fly-through portal in the central
+// ridge. terrainHeight carves a gap through the ridge near x = 0 (see physics.js);
+// these rock meshes fill it back in as two pillars and an overhead lintel,
+// leaving a clean tunnel opening between them (~64 m wide, ~80 m tall). Each
+// mesh has a matching AABB collision box: flying through the opening is
+// unobstructed, but touching any rock face triggers a ground-impact crash —
+// score penalty scaled by impact speed plus a reset to the spawn point.
+// ---------------------------------------------------------------------------
+const HOLLOW_MOUNTAIN_BOXES = []; // { minX,maxX,minY,maxY,minZ,maxZ }
+const archRockMat = new THREE.MeshStandardMaterial({ color: 0x6e747c, flatShading: true });
+
+function addArchRockBox(minX, maxX, minY, maxY, minZ, maxZ) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(maxX - minX, maxY - minY, maxZ - minZ),
+    archRockMat,
+  );
+  mesh.position.set((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  HOLLOW_MOUNTAIN_BOXES.push({ minX, maxX, minY, maxY, minZ, maxZ });
+}
+
+{
+  const z0 = ARCH.ridgeZ - ARCH.halfWidth; // north face of the ridge band
+  const z1 = ARCH.ridgeZ + ARCH.halfWidth; // south face
+  const pillarTop = ARCH.ceilingY;         // tunnel ceiling (lintel underside)
+  const lintelTop = ARCH.ceilingY + 34;    // arch summit
+
+  // Left & right rock faces flanking the opening — two stacked blocks each for
+  // a broken, low-poly silhouette. The outer edges sit flush with the carved
+  // cliff line in the heightmap (|x| = ARCH.carveHalf).
+  addArchRockBox(-ARCH.carveHalf, -ARCH.openingHalf, 8, pillarTop * 0.62, z0, z1);
+  addArchRockBox(-ARCH.carveHalf + 4, -ARCH.openingHalf - 3, pillarTop * 0.55, pillarTop, z0 + 6, z1 - 6);
+  addArchRockBox(ARCH.openingHalf, ARCH.carveHalf, 8, pillarTop * 0.62, z0, z1);
+  addArchRockBox(ARCH.openingHalf + 3, ARCH.carveHalf - 4, pillarTop * 0.55, pillarTop, z0 + 6, z1 - 6);
+
+  // Lintel / arch top spanning the opening — two stacked slabs.
+  addArchRockBox(-ARCH.carveHalf, ARCH.carveHalf, pillarTop, lintelTop - 8, z0, z1);
+  addArchRockBox(-ARCH.carveHalf + 5, ARCH.carveHalf - 5, lintelTop - 12, lintelTop, z0 + 4, z1 - 4);
+}
+
+// Rough footprint of the hollow-mountain structure (ridge band + arch zone),
+// used to keep scenery / thermals / prey out of the rock.
+function inArchZone(x, z) {
+  return Math.abs(x) < ARCH.carveHalf + 12 &&
+         z > ARCH.ridgeZ - ARCH.halfWidth - 10 &&
+         z < ARCH.ridgeZ + ARCH.halfWidth + 10;
+}
+
+// Point-in-structure test against the rock-face AABBs (small margin so a
+// grazing touch counts). Used by both the bird (crash/reset) and payloads.
+function insideHollowMountain(x, y, z, margin = 1.5) {
+  for (const b of HOLLOW_MOUNTAIN_BOXES) {
+    if (x > b.minX - margin && x < b.maxX + margin &&
+        y > b.minY - margin && y < b.maxY + margin &&
+        z > b.minZ - margin && z < b.maxZ + margin) return true;
+  }
+  return false;
+}
+
+// Crash into the hollow-mountain rock: ground-impact scoring (a penalty scaled
+// by impact speed, mirroring a payload hit) plus a reset to the spawn point.
+function crashIntoRock() {
+  score = Math.max(0, score - impactScore(birdState.speed));
+  spawnImpactBurst(birdState.x, birdState.y, birdState.z, birdState.speed);
+  if (carrying) { respawnPrey(carrying); carrying = null; } // drop the payload
+  Object.assign(birdState, {
+    x: SPAWN.x, y: SPAWN.y, z: SPAWN.z, yaw: 0, pitch: 0, roll: 0,
+    speed: FLIGHT.baseCruise, isTucking: false, tuckMomentum: 0, vy: 0,
+  });
+}
+
 // Deterministic scenery (pines + rocks) for depth cues.
 function mulberry32(seed) {
   return function () {
@@ -188,10 +266,15 @@ function mulberry32(seed) {
   const leafMat = new THREE.MeshStandardMaterial({ color: 0x2c5e3a, flatShading: true });
   const rockMat = new THREE.MeshStandardMaterial({ color: 0x7d8288, flatShading: true });
 
-  for (let i = 0; i < 36; i++) {
+  // Counts scale with the 750 m arena; trees and rocks stay in valleys and
+  // foothills (no pines on cliff faces) and clear of the hollow mountain.
+  let treesPlaced = 0, treeGuard = 0;
+  while (treesPlaced < 100 && treeGuard++ < 2000) {
     const x = (rand() * 2 - 1) * (HALF - 15);
     const z = (rand() * 2 - 1) * (HALF - 15);
     if (Math.abs(x) < 28 && Math.abs(z) < 28) continue; // keep spawn area clear
+    if (inArchZone(x, z)) continue;                    // no scenery inside the arch
+    if (terrainHeight(x, z) > 30) continue;            // trees only below treeline
     const tree = new THREE.Group();
     const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.4, 1.6, 5), trunkMat);
     trunk.position.y = 0.8;
@@ -201,16 +284,20 @@ function mulberry32(seed) {
     tree.position.set(x, terrainHeight(x, z), z);
     tree.traverse((o) => { o.castShadow = true; });
     scene.add(tree);
+    treesPlaced++;
   }
-  for (let i = 0; i < 20; i++) {
+  let rocksPlaced = 0, rockGuard = 0;
+  while (rocksPlaced < 45 && rockGuard++ < 1200) {
     const x = (rand() * 2 - 1) * (HALF - 15);
     const z = (rand() * 2 - 1) * (HALF - 15);
+    if (inArchZone(x, z)) continue; // no boulders inside the arch
     const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.8 + rand() * 1.4), rockMat);
     rock.scale.y = 0.6;
     rock.position.set(x, terrainHeight(x, z) + 0.3, z);
     rock.rotation.set(rand() * Math.PI, rand() * Math.PI, 0);
     rock.castShadow = true;
     scene.add(rock);
+    rocksPlaced++;
   }
 }
 
@@ -222,11 +309,22 @@ function mulberry32(seed) {
 const thermals = []; // { x, z } — deterministic column centers
 {
   const trand = mulberry32(9001);
-  let placed = 0;
-  while (placed < THERMAL.count && placed < 64) {
+
+  // Ridge-soaring cluster: columns hugging the central mountain's ridgeline and
+  // cliff faces (outside the arch zone) to reward flight along the spine.
+  for (const r of [
+    { x: -300, z: -48 }, { x: -210, z: -16 }, { x: -140, z: -42 },
+    { x: 140, z: -24 }, { x: 210, z: -50 }, { x: 300, z: -18 },
+  ]) thermals.push(r);
+
+  // Open-arena scatter fills the remaining columns across the 750 m world.
+  let placed = thermals.length;
+  let guard = 0;
+  while (placed < THERMAL.count && guard++ < 512) {
     const x = (trand() * 2 - 1) * (HALF - 45);
     const z = (trand() * 2 - 1) * (HALF - 45);
     if (Math.abs(x) < 35 && Math.abs(z) < 35) continue; // keep spawn area clear
+    if (inArchZone(x, z)) continue;                    // don't embed columns in the rock
     let tooClose = false;
     for (const t of thermals) {
       const dx = t.x - x, dz = t.z - z;
@@ -352,7 +450,7 @@ scene.add(birdGroup);
 // it later caused a TDZ ReferenceError that aborted the whole module at startup.
 // ---------------------------------------------------------------------------
 const birdState = {
-  x: 0, y: 45, z: 80, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise,
+  x: SPAWN.x, y: SPAWN.y, z: SPAWN.z, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise,
   isTucking: false, tuckMomentum: 0, vy: 0, // wing-tuck dive state (see physics.js TUCK); vy = vertical fall velocity while tucked
 };
 let carrying = null;   // prey object currently in the talons
@@ -418,15 +516,19 @@ function spawnPrey(kind, x, z) {
 }
 
 function randomPreySpot() {
-  for (let i = 0; i < 24; i++) {
-    const x = (Math.random() * 2 - 1) * PREY_BOUND;
+  for (let i = 0; i < 48; i++) {
+    const x = (Math.random() * 2 - 1) * PREY_BOUND; // roams the full 750 m arena
     const z = (Math.random() * 2 - 1) * PREY_BOUND;
-    if (Math.hypot(x - birdState.x, z - birdState.z) > 40) return { x, z };
+    if (Math.hypot(x - birdState.x, z - birdState.z) <= 40) continue;
+    if (inArchZone(x, z)) continue;          // no prey on the hollow mountain
+    if (terrainHeight(x, z) > 35) continue;  // ground creatures stay in valleys/foothills
+    return { x, z };
   }
-  return { x: 0, z: 0 };
+  return { x: 120, z: 240 }; // guaranteed-clear valley fallback (verified low terrain)
 }
 
-for (let i = 0; i < 8; i++) {
+// Prey count scales with the larger arena so the open ground stays populated.
+for (let i = 0; i < 12; i++) {
   const spot = randomPreySpot();
   spawnPrey(i % 2 === 0 ? 'rabbit' : 'squirrel', spot.x, spot.z);
 }
@@ -568,14 +670,22 @@ function updateProjectiles(dt) {
   for (let i = projectiles.length - 1; i >= 0; i--) {
     const pr = projectiles[i];
     stepProjectile(pr, dt);
+
+    // Out-of-arena payloads are lost — they left the world, no impact score.
+    if (!isInsideArena(pr.x, pr.z)) {
+      respawnPrey(pr.prey);
+      projectiles.splice(i, 1);
+      continue;
+    }
+
     pr.group.position.set(pr.x, pr.y, pr.z);
     pr.group.rotation.x += dt * 6; // tumble through the air
-    if (pr.y <= terrainHeight(pr.x, pr.z)) {
-      // Impact scoring: kinetic energy of the landing encodes both drop
-      // altitude and launch velocity — harder drops score more.
+    // Ground or hollow-mountain rock face: either ends the flight. A payload
+    // striking a cliff scores like a ground hit (kinetic energy of impact).
+    if (pr.y <= terrainHeight(pr.x, pr.z) || insideHollowMountain(pr.x, pr.y, pr.z, 0.5)) {
       const impactSpeed = Math.hypot(pr.vx, pr.vy, pr.vz);
       score += impactScore(impactSpeed);
-      spawnImpactBurst(pr.x, terrainHeight(pr.x, pr.z), pr.z, impactSpeed);
+      spawnImpactBurst(pr.x, Math.max(pr.y, terrainHeight(pr.x, pr.z)), pr.z, impactSpeed);
       updateHud();
       respawnPrey(pr.prey);
       projectiles.splice(i, 1);
@@ -784,6 +894,13 @@ function animate() {
     const floorY = terrainHeight(birdState.x, birdState.z) + 1;
     if (birdState.y < floorY) birdState.y = floorY;
     if (birdState.y > CEILING) birdState.y = CEILING;
+
+    // Hollow-mountain rock faces: touching them is a crash — impact penalty
+    // scaled by speed, then reset to the spawn point. The tunnel opening has no
+    // boxes, so flying through it stays clean.
+    if (insideHollowMountain(birdState.x, birdState.y, birdState.z)) {
+      crashIntoRock();
+    }
 
     // --- apply orientation to the bird mesh: q = Ry * Rx * Rz ---
     qYaw.setFromAxisAngle(AXIS_Y, birdState.yaw);

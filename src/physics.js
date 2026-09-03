@@ -51,7 +51,7 @@ export const GRAB = Object.freeze({
 });
 
 export const THERMAL = Object.freeze({
-  count: 5,          // updraft columns scattered around the arena
+  count: 18,         // updraft columns for the 750 m arena (several hug the central ridge)
   radius: 13,        // m   — horizontal core radius of a column
   liftAccel: 6,      // m/s² peak vertical updraft at column center
   speedRegen: 8,     // m/s airspeed recovered per second at full strength
@@ -65,6 +65,82 @@ export const IMPACT = Object.freeze({
   minScore: 15,     // points for a gentle landing
   maxScore: 250,    // points at reference-energy impact
 });
+
+// ---------------------------------------------------------------------------
+// World & terrain (750 m arena)
+// ---------------------------------------------------------------------------
+export const WORLD = Object.freeze({
+  size: 750,   // m — arena extent (square canvas surface)
+  half: 375,   // m — center-to-edge distance
+});
+
+// Hollow-mountain arch geometry. The central ridge runs along X at z = ridgeZ;
+// a tunnel is carved through it near x = 0 so the bird can fly straight through
+// the mountain. These constants drive both the terrain carving (terrainHeight,
+// below) and the rock meshes + collision boxes in main.js, so visuals and
+// physics always agree on where the rock is.
+export const ARCH = Object.freeze({
+  ridgeZ: -30,      // m — central ridgeline position (runs east-west along X)
+  halfWidth: 95,    // m — perpendicular falloff radius of the ridge band
+  carveHalf: 72,    // m — |x| extent of the carved tunnel zone
+  openingHalf: 32,  // m — half-width of the fly-through opening (64 m wide)
+  ceilingY: 96,     // m — world-Y of the lintel underside (tunnel ceiling)
+});
+
+// Sharp mountain peaks scattered across the arena. Fixed sites keep the map
+// deterministic; h = summit height above local ground, r = dome radius, and
+// k > 1 sharpens each dome into a peak instead of a smooth hill.
+const PEAKS = [
+  { x: -270, z: 250, r: 105, h: 74, k: 3.2 },   // NW massif
+  { x: 265, z: 255, r: 115, h: 84, k: 3.0 },    // SE massif (tallest)
+  { x: -250, z: -270, r: 100, h: 68, k: 3.4 },  // SW peak
+  { x: 300, z: -235, r: 90, h: 60, k: 3.1 },    // NE shoulder
+  { x: 40, z: 310, r: 85, h: 52, k: 3.5 },      // south spur
+];
+
+// Multi-frequency terrain heightmap for the 750 m arena (pure math — shared by
+// the mesh builder and every ground-collision check in main.js):
+//   layer 1: valley floor — broad gentle undulation (~±5 m)
+//   layer 2: rolling foothills — mid-frequency ridges sharpened into crests
+//   layer 3: sharp mountain peaks — fixed-site domes (see PEAKS)
+//   layer 4: central ridge — the hollow-mountain backbone. Inside
+//             |x| < ARCH.carveHalf the tunnel is carved out: ground drops back
+//             to valley level so the opening is a real gap, and explicit rock
+//             meshes in main.js form the pillars + lintel overhead.
+export function terrainHeight(x, z) {
+  // Layer 1 — valley floor.
+  const floor = Math.sin(x * 0.011 + 0.6) * Math.cos(z * 0.013 + 2.1) * 5;
+
+  // Layer 2 — rolling foothills (sharpened abs-sine ridges).
+  const r1 = Math.abs(Math.sin(x * 0.021 + z * 0.017));
+  const r2 = Math.abs(Math.cos(x * 0.019 - z * 0.023 + 1.4));
+  const foothills = Math.pow(r1, 2.5) * 13 + Math.pow(r2, 2.5) * 9;
+
+  // Layer 3 — sharp mountain peaks.
+  let mountains = 0;
+  for (const p of PEAKS) {
+    const dx = x - p.x;
+    const dz = z - p.z;
+    const t = 1 - (dx * dx + dz * dz) / (p.r * p.r);
+    if (t > 0) mountains += p.h * Math.pow(t, p.k);
+  }
+
+  // Layer 4 — central ridge (hollow-mountain backbone), carved at the tunnel.
+  let ridge = 0;
+  const dzr = z - ARCH.ridgeZ;
+  const across = 1 - (dzr / ARCH.halfWidth) ** 2;
+  if (across > 0 && Math.abs(x) >= ARCH.carveHalf) {
+    const peaks = 58 + 22 * Math.cos(x * 0.013) + 10 * Math.sin(x * 0.041 + 0.7);
+    ridge = peaks * Math.pow(across, 1.6);
+  }
+
+  return floor + foothills + mountains + ridge;
+}
+
+// World boundary check: true when (x, z) is inside the 750 m arena square.
+export function isInsideArena(x, z) {
+  return Math.abs(x) <= WORLD.half && Math.abs(z) <= WORLD.half;
+}
 
 export function clamp(v, min, max) {
   return v < min ? min : v > max ? max : v;

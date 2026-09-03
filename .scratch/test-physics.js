@@ -6,9 +6,9 @@
 //   4. launch velocity + projectile integration under gravity
 //   7. wing-tuck lift loss, ballistic fall arcs, gravity dives & weathercocking
 import {
-  FLIGHT, GRAB, THERMAL, IMPACT, TUCK, clamp, forwardVector, computeSpeedAccel,
+  FLIGHT, GRAB, THERMAL, IMPACT, TUCK, WORLD, ARCH, clamp, forwardVector, computeSpeedAccel,
   stepFlight, canGrab, launchVelocity, stepProjectile, thermalStrength,
-  impactEnergy, impactScore,
+  impactEnergy, impactScore, terrainHeight, isInsideArena,
 } from '../src/physics.js';
 
 let passed = 0;
@@ -350,6 +350,64 @@ console.log('\n[7] wing-tuck dive mechanic');
   check('tuck flag persists across steps', s2.isTucking === true);
   const s3 = stepFlight(s2, { pitch: -1, roll: 0, isTucking: false }, 0.05);
   check('tuck flag cleared on release', s3.isTucking === false);
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[8] 750 m arena bounds & terrain heightmap');
+{
+  // World constants scale to the expanded arena.
+  check('arena is 750 x 750', WORLD.size === 750 && WORLD.half === 375);
+
+  // Boundary checks: center and edges inside, just outside rejected.
+  check('center of arena is inside', isInsideArena(0, 0));
+  check('edge points are inside (±half)',
+    isInsideArena(WORLD.half, 0) && isInsideArena(-WORLD.half, WORLD.half) &&
+    isInsideArena(WORLD.half, -WORLD.half));
+  check('points just outside the edge are rejected',
+    !isInsideArena(WORLD.half + 1, 0) && !isInsideArena(0, -WORLD.half - 1) &&
+    !isInsideArena(-WORLD.half - 0.5, WORLD.half + 0.5));
+
+  // Thermal count scaled up for the larger world (15-20 columns).
+  check('thermal count scaled to 15-20', THERMAL.count >= 15 && THERMAL.count <= 20);
+
+  // Heightmap sanity across the full arena: finite, bounded, with real relief.
+  let minH = Infinity, maxH = -Infinity;
+  for (let x = -WORLD.half; x <= WORLD.half; x += 15) {
+    for (let z = -WORLD.half; z <= WORLD.half; z += 15) {
+      const h = terrainHeight(x, z);
+      if (!Number.isFinite(h)) minH = NaN;
+      minH = Math.min(minH, h);
+      maxH = Math.max(maxH, h);
+    }
+  }
+  check('terrain heights finite across arena', Number.isFinite(minH) && Number.isFinite(maxH));
+  check('valley floors stay low (min < 15 m)', minH < 15, `min=${minH}`);
+  check('mountain peaks rise high (max > 60 m)', maxH > 60, `max=${maxH}`);
+  check('heights stay within sane bounds', minH > -20 && maxH < 140, `range [${minH}, ${maxH}]`);
+
+  // Central ridge: a high wall on both sides of the arch zone...
+  const ridgeWest = terrainHeight(-150, ARCH.ridgeZ);
+  const ridgeEast = terrainHeight(150, ARCH.ridgeZ);
+  check('central ridge is a high wall west of the arch', ridgeWest > 40, `h=${ridgeWest}`);
+  check('central ridge is a high wall east of the arch', ridgeEast > 40, `h=${ridgeEast}`);
+
+  // ...and carved into a low tunnel through the opening.
+  const gap = terrainHeight(0, ARCH.ridgeZ);
+  check('tunnel floor is low at the opening center', gap < 30, `h=${gap}`);
+  let gapLow = true;
+  for (let x = -ARCH.openingHalf; x <= ARCH.openingHalf; x += 4) {
+    if (terrainHeight(x, ARCH.ridgeZ) > 35) gapLow = false;
+  }
+  check('whole opening line stays flyable (< 35 m)', gapLow);
+
+  // Cliff step at the carve boundary: rock face rises sharply just outside.
+  const cliffIn = terrainHeight(ARCH.carveHalf - 4, ARCH.ridgeZ);
+  const cliffOut = terrainHeight(ARCH.carveHalf + 6, ARCH.ridgeZ);
+  check('rock face rises sharply at the carve boundary', cliffOut > cliffIn + 25, `in=${cliffIn} out=${cliffOut}`);
+
+  // Spawn point is clear of the structure and above local ground.
+  const spawnH = terrainHeight(0, 80);
+  check('spawn sits in open valley (low ground)', spawnH < 30, `h=${spawnH}`);
 }
 
 // ---------------------------------------------------------------------------
