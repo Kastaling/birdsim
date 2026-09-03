@@ -4,6 +4,7 @@
 //   2. forward-vector orientation math
 //   3. grab condition on low swoops
 //   4. launch velocity + projectile integration under gravity
+//   7. wing-tuck lift loss, ballistic fall arcs, and gravity dives
 import {
   FLIGHT, GRAB, THERMAL, IMPACT, TUCK, clamp, forwardVector, computeSpeedAccel,
   stepFlight, canGrab, launchVelocity, stepProjectile, thermalStrength,
@@ -195,32 +196,104 @@ console.log('\n[6] thermal updraft strength');
 // ---------------------------------------------------------------------------
 console.log('\n[7] wing-tuck dive mechanic');
 {
-  // --- drag reduction (75%) while tucking ---
-  // Level flight above cruise: the only term is drag, so the tuck must cut it
-  // to exactly TUCK.dragFactor of normal.
-  const aLevelNormal = computeSpeedAccel(40, 0, false);
-  const aLevelTuck = computeSpeedAccel(40, 0, true);
-  check('tuck cuts drag to 25% of normal (75% reduction)', approx(aLevelTuck, aLevelNormal * TUCK.dragFactor), `got ${aLevelTuck} vs ${aLevelNormal}`);
+  // --- lift loss (90% reduction) while tucking ---
+  // Level cruise is a fixed point with wings out but not while tucked: with no
+  // lift to hold airspeed, the only level-flight term is bleed-off.
+  check('level cruise stable with wings out', approx(computeSpeedAccel(FLIGHT.baseCruise, 0), 0));
+  const aLevelTuck = computeSpeedAccel(FLIGHT.baseCruise, 0, true);
+  check('tuck kills lift: level flight no longer holds airspeed',
+    aLevelTuck < 0 && approx(aLevelTuck, -FLIGHT.baseCruise * TUCK.levelBleed), `got ${aLevelTuck}`);
 
-  // --- higher longitudinal acceleration in a dive while tucking ---
-  const aDiveNormal = computeSpeedAccel(40, -Math.PI / 3, false);
-  const aDiveTuck = computeSpeedAccel(40, -Math.PI / 3, true);
-  check('tuck dive accelerates harder than normal dive',
-    aDiveTuck > aDiveNormal + TUCK.diveAccel * Math.sin(Math.PI / 3) * 0.9, `got ${aDiveTuck} vs ${aDiveNormal}`);
-
-  // The extra dive accel only applies while pointing downward — climbing
-  // tucks differ from normal climbs by the drag reduction alone.
-  const aClimbNormal = computeSpeedAccel(40, Math.PI / 6, false);
+  // A pitched-up tuck bleeds speed even harder (gravity + bleed, no lift).
   const aClimbTuck = computeSpeedAccel(40, Math.PI / 6, true);
-  check('tuck adds no dive accel while climbing',
-    approx(aClimbTuck - aClimbNormal, (FLIGHT.baseCruise - 40) * FLIGHT.dragCoeff * (TUCK.dragFactor - 1)),
-    `got ${aClimbTuck} vs ${aClimbNormal}`);
+  check('tucked climb trades speed for altitude with no lift',
+    aClimbTuck < -FLIGHT.diveAccel * 0.5, `got ${aClimbTuck}`);
 
-  // --- higher terminal velocity: sustained tuck dive breaks the normal ceiling ---
+  // --- ballistic fall arc: level tuck converts forward momentum into a drop ---
+  let lt = { x: 0, y: 200, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
+  for (let i = 0; i < 80; i++) lt = stepFlight(lt, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 4 s level tuck
+  check('level tuck bleeds forward airspeed', lt.speed < FLIGHT.baseCruise - 10, `got ${lt.speed}`);
+  check('level tuck falls in a ballistic arc under gravity', lt.y < 200 - 30 && lt.vy < 0, `y=${lt.y} vy=${lt.vy}`);
+
+  // Fall velocity saturates at the terminal fall speed.
+  let lf = { x: 0, y: 500, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
+  for (let i = 0; i < 600; i++) lf = stepFlight(lf, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 30 s
+  check('tuck fall saturates at terminal fall speed', approx(lf.vy, -TUCK.maxFallSpeed), `got ${lf.vy}`);
+
+  // --- speed gain strictly from altitude -> velocity in a steep dive ---
+  // No artificial accelerator: the tuck-dive term is exactly gravity along the
+  // flight path minus reduced drag.
+  const pD = -Math.PI / 3;
+  check('tuck dive accel = gravity trade - reduced drag (no extra thrust)',
+    approx(computeSpeedAccel(40, pD, true), -FLIGHT.diveAccel * Math.sin(pD) - 40 * TUCK.diveDrag), `got ${computeSpeedAccel(40, pD, true)}`);
+
+  // Level or pitched-up tucks never gain speed; a steep dive does.
+  check('no speed gain while tucked level', computeSpeedAccel(24, 0, true) < 0);
+  check('no speed gain while tucked and pitched up', computeSpeedAccel(24, Math.PI / 6, true) < 0);
+  check('steep tuck dive gains speed from the altitude trade', computeSpeedAccel(24, -FLIGHT.maxPitch, true) > 0);
+
+  // At high airspeed a tucked dive sheds less drag than a normal dive.
+  const hi = -FLIGHT.maxPitch;
+  check('tuck dive retains more of the gravity gain at speed',
+    computeSpeedAccel(80, hi, true) > computeSpeedAccel(80, hi, false), `tuck ${computeSpeedAccel(80, hi, true)} vs free ${computeSpeedAccel(80, hi, false)}`);
+
+  // Sustained tuck dive breaks the normal ceiling and saturates at the elevated one.
   let td = { x: 0, y: 300, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: -FLIGHT.maxPitch, roll: 0 };
   for (let i = 0; i < 600; i++) td = stepFlight(td, { pitch: -1, roll: 0, isTucking: true }, 0.05); // 30 s tuck dive
   check('tuck dive breaks the normal speed ceiling', td.speed > FLIGHT.maxSpeed + 10, `got ${td.speed}`);
   check('tuck dive saturates at the elevated ceiling', approx(td.speed, TUCK.maxSpeed), `got ${td.speed}`);
+
+  // Dive energy budget: kinetic-energy gain over a tuck dive never exceeds the
+  // gravitational potential lost — speed gain strictly from trading altitude.
+  {
+    let eb = { x: 0, y: 300, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: -FLIGHT.maxPitch, roll: 0 };
+    const ke0 = 0.5 * (eb.speed ** 2 + (eb.vy || 0) ** 2);
+    for (let i = 0; i < 120; i++) eb = stepFlight(eb, { pitch: -1, roll: 0, isTucking: true }, 0.05); // 6 s tuck dive
+    const ke1 = 0.5 * (eb.speed ** 2 + eb.vy ** 2);
+    const dh = 300 - eb.y; // altitude lost
+    check('tuck dive speed gain comes from the altitude trade',
+      ke1 > ke0 && ke1 - ke0 <= FLIGHT.diveAccel * dh * 1.05, `dKE=${ke1 - ke0} vs g*dh=${FLIGHT.diveAccel * dh}`);
+  }
+
+  // --- catch air on release: vertical fall momentum -> forward glide speed ---
+  let ct = { x: 0, y: 200, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: 0, roll: 0 };
+  for (let i = 0; i < 80; i++) ct = stepFlight(ct, { pitch: 0, roll: 0, isTucking: true }, 0.05); // 4 s level tuck
+  const preCatch = ct.speed;
+  const fallVy = ct.vy;
+  check('level tuck builds vertical fall momentum', fallVy < -10, `vy=${fallVy}`);
+
+  // Release while level: the catch converts fall velocity into forward glide speed.
+  const caught = stepFlight(ct, { pitch: 0, roll: 0, isTucking: false }, 0.05);
+  check('releasing level catches the air (fall -> forward glide)',
+    Math.abs(caught.speed - (preCatch + (-fallVy) * TUCK.catchFactor)) < 1 && caught.speed > preCatch, `got ${caught.speed} vs ${preCatch}`);
+  check('fall velocity cleared after wing re-engage', caught.vy === 0);
+
+  // Full lift restored: holding level relaxes the catch speed back toward cruise.
+  let settle = caught;
+  for (let i = 0; i < 300; i++) settle = stepFlight(settle, { pitch: 0, roll: 0 }, 0.05); // 15 s level
+  check('full lift restored after catch (speed relaxes to cruise)', Math.abs(settle.speed - FLIGHT.baseCruise) < 2, `got ${settle.speed}`);
+
+  // Releasing mid-dive (still steeply down) does NOT convert fall momentum —
+  // the dive keeps trading altitude for speed on its own.
+  let md = { x: 0, y: 300, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: -FLIGHT.maxPitch, roll: 0 };
+  for (let i = 0; i < 120; i++) md = stepFlight(md, { pitch: -1, roll: 0, isTucking: true }, 0.05); // 6 s tuck dive
+  const preDiveRelease = md.speed;
+  const diveRelease = stepFlight(md, { pitch: 0, roll: 0, isTucking: false }, 0.05);
+  check('mid-dive release gets no catch boost', Math.abs(diveRelease.speed - preDiveRelease) < 1.5 && diveRelease.vy === 0, `got ${diveRelease.speed} vs ${preDiveRelease}`);
+
+  // --- excess airspeed preserved on release (no instant clamp) ---
+  let hd = { x: 0, y: 300, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: -FLIGHT.maxPitch, roll: 0 };
+  for (let i = 0; i < 600; i++) hd = stepFlight(hd, { pitch: -1, roll: 0, isTucking: true }, 0.05); // 30 s -> ceiling
+  const preHigh = hd.speed;
+  const pulledUp = stepFlight(hd, { pitch: 1, roll: 0, isTucking: false }, 0.05);
+  check('un-tuck preserves dive speed above the normal ceiling',
+    pulledUp.speed > FLIGHT.maxSpeed && pulledUp.speed >= preHigh - 2, `got ${pulledUp.speed} vs pre ${preHigh}`);
+
+  // Full drag bleeds the excess off: holding the nose down settles at the normal ceiling.
+  let decay = pulledUp;
+  for (let i = 0; i < 600; i++) decay = stepFlight(decay, { pitch: 0, roll: 0 }, 0.05); // 30 s, nose held
+  check('elevated ceiling closes after release',
+    approx(decay.speed, FLIGHT.maxSpeed) && decay.tuckMomentum === 0, `got ${decay.speed}, momentum=${decay.tuckMomentum}`);
 
   // --- locked wings: roll & yaw authority damped while tucking ---
   let rFree = { x: 0, y: 20, z: 0, speed: 45, yaw: 0, pitch: -0.6, roll: 0 };
@@ -239,31 +312,6 @@ console.log('\n[7] wing-tuck dive mechanic');
   check('tuck flag persists across steps', s2.isTucking === true);
   const s3 = stepFlight(s2, { pitch: -1, roll: 0, isTucking: false }, 0.05);
   check('tuck flag cleared on release', s3.isTucking === false);
-
-  // --- speed preservation & burst on wing release (pitch up to catch the air) ---
-  let st = { x: 0, y: 200, z: 0, speed: FLIGHT.baseCruise, yaw: 0, pitch: -FLIGHT.maxPitch, roll: 0 };
-  for (let i = 0; i < 30; i++) st = stepFlight(st, { pitch: -1, roll: 0, isTucking: true }, 0.05); // 1.5 s tuck dive
-  const preSpeed = st.speed;
-  check('short tuck dive builds excess speed below the ceiling',
-    preSpeed > FLIGHT.baseCruise + 20 && preSpeed < TUCK.maxSpeed - 5, `got ${preSpeed}`);
-
-  // Release while pitching up: accumulated dive momentum converts to a forward
-  // burst — speed is preserved (not clamped back down) and boosted.
-  const pulledUp = stepFlight(st, { pitch: 1, roll: 0, isTucking: false }, 0.05);
-  check('un-tuck while pitching up preserves dive speed',
-    pulledUp.speed >= preSpeed && pulledUp.speed > FLIGHT.maxSpeed, `got ${pulledUp.speed} vs pre ${preSpeed}`);
-
-  // The same release without pitching up gets no burst — the pitch-up catch is what pays off.
-  const flatRelease = stepFlight(st, { pitch: 0, roll: 0, isTucking: false }, 0.05);
-  check('pitch-up release bursts faster than a flat release',
-    pulledUp.speed > flatRelease.speed + 1, `pulled ${pulledUp.speed} vs flat ${flatRelease.speed}`);
-
-  // Full aerodynamics re-engage after the burst: residual momentum bleeds off,
-  // the elevated ceiling closes, and speed is clamped back to the normal limit.
-  let decay = pulledUp;
-  for (let i = 0; i < 600; i++) decay = stepFlight(decay, { pitch: 0, roll: 0 }, 0.05); // 30 s, nose held
-  check('elevated ceiling closes after release',
-    approx(decay.speed, FLIGHT.maxSpeed) && decay.tuckMomentum === 0, `got ${decay.speed}, momentum=${decay.tuckMomentum}`);
 }
 
 // ---------------------------------------------------------------------------

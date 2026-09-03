@@ -353,7 +353,7 @@ scene.add(birdGroup);
 // ---------------------------------------------------------------------------
 const birdState = {
   x: 0, y: 45, z: 80, yaw: 0, pitch: 0, roll: 0, speed: FLIGHT.baseCruise,
-  isTucking: false, tuckMomentum: 0, // wing-tuck dive state (see physics.js TUCK)
+  isTucking: false, tuckMomentum: 0, vy: 0, // wing-tuck dive state (see physics.js TUCK); vy = vertical fall velocity while tucked
 };
 let carrying = null;   // prey object currently in the talons
 let score = 0;

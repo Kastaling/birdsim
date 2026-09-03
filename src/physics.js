@@ -18,19 +18,25 @@ export const FLIGHT = Object.freeze({
 });
 
 // Wing-tuck dive mechanic: holding the tuck key (Shift / left trigger) folds
-// the wings in, slashing drag so a steep dive trades altitude for extreme
-// airspeed. Releasing while pitching up converts the accumulated dive momentum
-// into a forward speed burst as full aerodynamics re-engage.
+// the wings in — ~90% of aerodynamic lift is lost and drag is slashed. With no
+// lift to hold airspeed or support weight, a level/pitched-up tuck bleeds off
+// horizontal speed and drops in a ballistic arc under gravity; only pointing
+// the nose down trades altitude for airspeed (gravity along the flight path —
+// there is no artificial accelerator). Releasing while level or pitched up
+// catches the air: vertical fall momentum converts back into forward glide
+// speed as full aerodynamic lift re-engages.
 export const TUCK = Object.freeze({
-  dragFactor: 0.25,     // keep 25% of normal drag while tucking (75% reduction)
-  diveAccel: 18,        // m/s² — extra longitudinal accel at full vertical dive
-  maxSpeed: 90,         // m/s   — elevated speed ceiling while tucking / with residual momentum
+  liftFactor: 0.1,      // fraction of normal aerodynamic lift retained (90% reduction)
+  diveDrag: 0.08,       // 1/s — reduced drag opposing the gravity gain in a locked-wing dive
+  levelBleed: 0.35,     // 1/s — horizontal speed bleed when tucked level/pitched-up (no lift to hold airspeed)
+  fallGravity: 9,       // m/s² — ballistic fall acceleration while tucking (matches FLIGHT.diveAccel dive gravity)
+  maxFallSpeed: 32,     // m/s — terminal vertical fall speed while tucking
+  catchPitch: -0.4,     // rad (~-23°) — releasing at or above this pitch catches the air; steeper stays in the dive
+  catchFactor: 0.85,    // fraction of vertical fall momentum converted to forward glide on wing re-engage
+  residualBank: 0.5,    // fraction of excess airspeed above cruise banked as residual momentum on release
   rollFactor: 0.15,     // roll input authority multiplier (locked wings)
   yawFactor: 0.25,      // auto-coordinated turn rate multiplier (locked wings)
-  momentumGain: 1.0,    // excess airspeed accumulated into dive momentum per second
-  momentumCap: 40,      // m/s — cap on accumulated dive momentum
-  burstFactor: 0.6,     // fraction of momentum converted to a forward burst on un-tuck while pitching up
-  burstResidual: 0.5,   // residual momentum kept after the burst (keeps the elevated ceiling open)
+  maxSpeed: 90,         // m/s — elevated speed ceiling while tucking / with residual momentum
   momentumDecay: 12,    // m/s per second that residual momentum bleeds off after release
 });
 
@@ -72,30 +78,43 @@ export function forwardVector(yaw, pitch) {
   };
 }
 
-// Longitudinal speed dynamics: diving (pitch < 0) trades altitude for airspeed,
-// climbing (pitch > 0) trades airspeed for altitude; drag relaxes toward cruise.
-// While tucking (`isTucking`), drag is cut to TUCK.dragFactor of normal and an
-// extra dive acceleration applies while pointing downward — together they raise
-// the terminal velocity well above the normal FLIGHT.maxSpeed ceiling.
+// Longitudinal speed dynamics. Gravity along the flight path is the only source
+// of speed gain in a dive (pitch < 0): altitude converts to airspeed at
+// FLIGHT.diveAccel per unit sin(pitch); climbing trades it back for altitude.
+// With wings out, drag relaxes toward cruise. While tucking (`isTucking`) lift
+// is ~90% gone: nothing maintains airspeed — a dive keeps only the gravity gain
+// minus reduced drag (raising terminal velocity above FLIGHT.maxSpeed), and
+// level/pitched-up flight bleeds horizontal speed off instead of holding it.
 export function computeSpeedAccel(speed, pitch, isTucking = false) {
-  const dragCoeff = isTucking ? FLIGHT.dragCoeff * TUCK.dragFactor : FLIGHT.dragCoeff;
-  let accel = -FLIGHT.diveAccel * Math.sin(pitch);
-  if (isTucking && pitch < 0) {
-    // Locked-wing dive: extra acceleration while pointing downward.
-    accel += TUCK.diveAccel * (-Math.sin(pitch));
+  let accel = -FLIGHT.diveAccel * Math.sin(pitch); // altitude <-> airspeed trade
+  if (isTucking) {
+    if (pitch < 0) {
+      // Locked-wing dive: no lift, no cruise maintenance — only reduced drag
+      // opposes the gravitational gain.
+      accel -= speed * TUCK.diveDrag;
+    } else {
+      // Level or pitched up with no lift to hold airspeed: bleed off.
+      accel -= speed * TUCK.levelBleed;
+    }
+  } else {
+    accel += (FLIGHT.baseCruise - speed) * FLIGHT.dragCoeff; // drag relaxes toward cruise
   }
-  const drag = (FLIGHT.baseCruise - speed) * dragCoeff;
-  return accel + drag;
+  return accel;
 }
 
 // Advance the flight state one step. `input` = { pitch: -1..1, roll: -1..1,
 // isTucking?: boolean } (pitch +1 climbs / nose up, roll +1 banks left). The
 // tuck flag comes from held input each frame and is recorded on the returned
-// state; releasing it while pitching up converts accumulated dive momentum into
-// a forward speed burst. Returns a new state object.
+// state. While tucking, lift is ~90% gone: horizontal speed bleeds off unless
+// the nose points down into a dive, and the bird drops in a ballistic arc under
+// gravity tracked as `vy` (vertical fall velocity, negative = falling).
+// Releasing while level or pitched up catches the air — vertical fall momentum
+// converts to forward glide speed and full aerodynamic lift re-engages.
+// Returns a new state object.
 export function stepFlight(state, input = {}, dt) {
   const wasTucking = !!state.isTucking;
   const isTucking = !!input.isTucking;
+  let vy = state.vy || 0; // vertical fall velocity (m/s, negative = falling); tuck only
 
   // Pitch authority is unchanged by the tuck — pulling out of a dive still works.
   const pitch = clamp(
@@ -115,39 +134,50 @@ export function stepFlight(state, input = {}, dt) {
   const yawAuthority = isTucking ? TUCK.yawFactor : 1;
   const yaw = state.yaw + Math.sin(roll) * FLIGHT.yawCoordination * yawAuthority * dt;
 
-  // Longitudinal speed: reduced drag + extra dive accel while tucking.
+  // Longitudinal speed: gravity trade in a dive; bleed when level/pitched-up tucked.
   let speed = state.speed + computeSpeedAccel(state.speed, pitch, isTucking) * dt;
+
+  // Ballistic fall while tucking: with lift gone the bird drops under gravity.
+  // The component of gravity perpendicular to the flight path feeds vertical fall
+  // velocity — full when level (cos 0 = 1), none in a vertical dive where all of
+  // gravity already converts along the nose into airspeed. Residual lift slows it slightly.
+  if (isTucking) {
+    vy -= TUCK.fallGravity * Math.cos(pitch) * (1 - TUCK.liftFactor) * dt;
+    vy = clamp(vy, -TUCK.maxFallSpeed, 0);
+  }
+
+  // Residual dive momentum: banked on release from excess airspeed above cruise,
+  // bleeds off as full drag re-engages.
+  let tuckMomentum = state.tuckMomentum || 0;
+
+  // Wing re-engage: releasing the tuck while level or pitched up catches the air —
+  // vertical fall momentum converts to forward glide speed. Releasing mid-dive
+  // (still steeply down) gets no catch; the dive keeps trading altitude for speed.
+  if (wasTucking && !isTucking) {
+    if (vy < 0 && pitch >= TUCK.catchPitch) {
+      speed += -vy * TUCK.catchFactor;
+    }
+    // Bank excess airspeed above cruise so the elevated ceiling stays open while
+    // full drag bleeds it off gradually instead of clamping it away instantly.
+    tuckMomentum = Math.max(tuckMomentum, Math.max(0, speed - FLIGHT.baseCruise) * TUCK.residualBank);
+  }
 
   // Speed ceiling: elevated while tucking or while residual dive momentum from a
   // recent un-tuck keeps the excess airspeed above the normal FLIGHT.maxSpeed.
-  const hasMomentum = (state.tuckMomentum || 0) > 0;
+  const hasMomentum = tuckMomentum > 0;
   const ceiling = (isTucking || hasMomentum) ? TUCK.maxSpeed : FLIGHT.maxSpeed;
   speed = clamp(speed, FLIGHT.minSpeed, ceiling);
 
-  // Dive momentum bookkeeping: accumulates from excess airspeed above cruise
-  // while tucking in a dive, bleeds off after release as full drag re-engages.
-  let tuckMomentum = state.tuckMomentum || 0;
-  if (isTucking && pitch < 0) {
-    const excess = Math.max(0, speed - FLIGHT.baseCruise);
-    tuckMomentum = Math.min(TUCK.momentumCap, tuckMomentum + excess * TUCK.momentumGain * dt);
-  } else if (!isTucking) {
+  if (!isTucking) {
     tuckMomentum = Math.max(0, tuckMomentum - TUCK.momentumDecay * dt);
   }
 
-  // Un-tuck burst: releasing the tuck while pitching up to catch the air
-  // converts accumulated dive momentum into a forward speed boost. A residual
-  // keeps the elevated ceiling open so full drag bleeds the excess off gradually
-  // instead of clamping it away instantly.
-  if (wasTucking && !isTucking && (input.pitch || 0) > 0 && tuckMomentum > 0) {
-    speed += tuckMomentum * TUCK.burstFactor;
-    speed = clamp(speed, FLIGHT.minSpeed, TUCK.maxSpeed);
-    tuckMomentum = Math.max(0, speed - FLIGHT.baseCruise) * TUCK.burstResidual;
-  }
+  if (!isTucking) vy = 0; // lift restored — no residual fall velocity outside a tuck
 
   const f = forwardVector(yaw, pitch);
   return {
     x: state.x + f.x * speed * dt,
-    y: state.y + f.y * speed * dt,
+    y: state.y + (f.y * speed + vy) * dt,
     z: state.z + f.z * speed * dt,
     yaw,
     pitch,
@@ -155,6 +185,7 @@ export function stepFlight(state, input = {}, dt) {
     speed,
     isTucking,
     tuckMomentum,
+    vy,
   };
 }
 
